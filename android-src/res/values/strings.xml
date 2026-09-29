@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BLE Unlock</string>
+    <string name="channel_name">蓝牙连接状态</string>
+    <string name="channel_desc">保持与 Mac 的蓝牙连接以便随时解锁</string>
+</resources>
