@@ -20,7 +20,6 @@ import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Handler;
@@ -47,11 +46,15 @@ public class BleService extends Service {
     public static final String ACTION_START = "com.bleunlock.remote.START";
     public static final String ACTION_STOP = "com.bleunlock.remote.STOP";
     public static final String ACTION_SEND = "com.bleunlock.remote.SEND";
+    /** 切换当前选中的 Mac（会断开重连） */
+    public static final String ACTION_SELECT = "com.bleunlock.remote.SELECT";
     public static final String EXTRA_COMMAND = "command";
 
     public static final String BROADCAST_STATE = "com.bleunlock.remote.STATE";
     public static final String EXTRA_STATE = "state";
     public static final String EXTRA_DETAIL = "detail";
+    /** 当前正在连接/已连接的 Mac 备注名，供界面显示 */
+    public static final String EXTRA_MAC_NAME = "mac_name";
 
     public static final String STATE_SCANNING = "扫描中";
     public static final String STATE_CONNECTING = "连接中";
@@ -90,6 +93,12 @@ public class BleService extends Service {
     private String targetAddress = null;
     private byte[] key = null;
 
+    /** 当前选中的 Mac 记录（多密钥支持） */
+    private MacEntryStore store;
+    private MacEntryStore.Entry activeEntry;
+    /** 设备名提示：服务端广播以 "BLEUnlock-" 开头，用于 UUID 匹配失败时兜底 */
+    private String nameHint = null;
+
     public class LocalBinder extends Binder {
         public BleService getService() {
             return BleService.this;
@@ -107,7 +116,8 @@ public class BleService extends Service {
         if (adapter != null) {
             scanner = adapter.getBluetoothLeScanner();
         }
-        reloadKey();
+        store = new MacEntryStore(this);
+        reloadActiveMac();
     }
 
     @Override
@@ -115,9 +125,22 @@ public class BleService extends Service {
         if (intent != null && intent.getAction() != null) {
             switch (intent.getAction()) {
                 case ACTION_START:
-                    reloadKey();
+                    reloadActiveMac();
                     wantConnection = true;
                     startScan();
+                    break;
+                case ACTION_SELECT:
+                    // 切换目标 Mac：断开当前连接后重新开始
+                    reloadActiveMac();
+                    if (activeEntry == null) {
+                        publish(STATE_ERROR, "尚未配置任何 Mac");
+                        break;
+                    }
+                    wantConnection = true;
+                    stopScan();
+                    closeGatt();
+                    publish(STATE_SCANNING, "已切换到 " + activeEntry.displayName() + "，正在连接…");
+                    handler.postDelayed(this::startScan, 500);
                     break;
                 case ACTION_STOP:
                     wantConnection = false;
@@ -152,14 +175,27 @@ public class BleService extends Service {
 
     // ---------------------------------------------------------------- 密钥
 
-    private void reloadKey() {
-        SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
-        String token = prefs.getString(MainActivity.KEY_TOKEN, "");
-        key = Protocol.parseToken(token);
+    /** 重新读取选中的 Mac 记录；密钥与设备名提示一并更新 */
+    private void reloadActiveMac() {
+        if (store == null) store = new MacEntryStore(this);
+        activeEntry = store.selected();
+        if (activeEntry == null) {
+            key = null;
+            nameHint = null;
+            return;
+        }
+        key = activeEntry.keyBytes();
+        // 广播名形如 "BLEUnlock-xxx"，这里只取前缀做兜底匹配
+        nameHint = "BLEUnlock";
+    }
+
+    /** 供界面查询当前选中的备注名 */
+    public String getActiveMacName() {
+        return activeEntry == null ? null : activeEntry.displayName();
     }
 
     private boolean hasKey() {
-        if (key == null) reloadKey();
+        if (key == null) reloadActiveMac();
         return key != null;
     }
 
@@ -190,13 +226,16 @@ public class BleService extends Service {
                 } catch (SecurityException ignored) {
                 }
             }
-            if (!matches && name != null && name.startsWith("BLEUnlock")) {
+            if (!matches && nameHint != null && name != null && name.startsWith(nameHint)) {
                 matches = true;
             }
             if (!matches) return;
 
             Log.i(TAG, "发现目标设备 " + name + " " + device.getAddress());
             targetAddress = device.getAddress();
+            if (store != null && activeEntry != null) {
+                store.rememberAddress(activeEntry.id, targetAddress);
+            }
             stopScan();
             connectTo(device);
         }
@@ -216,6 +255,24 @@ public class BleService extends Service {
         if (scanning) return;
         if (gatt != null) return; // 已有连接，无需扫描
 
+        if (activeEntry == null) {
+            publish(STATE_ERROR, "尚未配置任何 Mac，请先添加");
+            return;
+        }
+
+        // 曾经连过就直接连，省掉一轮扫描（明显更快）
+        if (activeEntry.address != null && !activeEntry.address.isEmpty()) {
+            try {
+                BluetoothDevice known = adapter.getRemoteDevice(activeEntry.address);
+                publish(STATE_CONNECTING, "正在连接 " + activeEntry.displayName() + "…");
+                connectTo(known);
+                return;
+            } catch (IllegalArgumentException e) {
+                // 地址非法（例如换机后残留），清掉后走扫描
+                store.rememberAddress(activeEntry.id, "");
+            }
+        }
+
         scanner = adapter.getBluetoothLeScanner();
         if (scanner == null) {
             publish(STATE_ERROR, "无法获取蓝牙扫描器");
@@ -227,7 +284,7 @@ public class BleService extends Service {
                     .build();
             scanner.startScan(null, settings, scanCallback);
             scanning = true;
-            publish(STATE_SCANNING, "正在搜索 Mac…");
+            publish(STATE_SCANNING, "正在搜索 " + activeEntry.displayName() + "…");
         } catch (SecurityException e) {
             publish(STATE_ERROR, "缺少蓝牙扫描权限");
         }
@@ -408,7 +465,6 @@ public class BleService extends Service {
                 g.close();
             } catch (SecurityException ignored) {
             }
-            g.close();
         }
     }
 
@@ -416,9 +472,13 @@ public class BleService extends Service {
 
     /** 供界面直接调用。返回 null 表示成功，否则返回错误说明。 */
     public String sendCommand(byte command) {
+        if (activeEntry == null) {
+            publish(STATE_ERROR, "尚未配置任何 Mac，请先添加");
+            return "尚未配置任何 Mac";
+        }
         if (!hasKey()) {
-            publish(STATE_ERROR, "请先填写配对令牌");
-            return "请先填写配对令牌";
+            publish(STATE_ERROR, activeEntry.displayName() + " 的令牌无效");
+            return "令牌无效，请重新填写";
         }
         BluetoothGatt g = gatt;
         BluetoothGattCharacteristic c = commandChar;
@@ -454,6 +514,7 @@ public class BleService extends Service {
         intent.setPackage(getPackageName());
         intent.putExtra(EXTRA_STATE, state);
         intent.putExtra(EXTRA_DETAIL, detail);
+        intent.putExtra(EXTRA_MAC_NAME, getActiveMacName());
         sendBroadcast(intent);
     }
 

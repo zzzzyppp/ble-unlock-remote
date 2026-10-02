@@ -33,6 +33,11 @@ BUILD_TOOLS_VERSION="${BUILD_TOOLS_VERSION:-}"
 MIN_SDK="26"
 TARGET_SDK="34"
 
+# 版本号：每次改动功能都应递增 versionCode，否则手机上无法覆盖安装。
+# 可用环境变量临时覆盖：VERSION_CODE=3 VERSION_NAME=1.2.0 ./build.sh
+VERSION_CODE="${VERSION_CODE:-2}"
+VERSION_NAME="${VERSION_NAME:-1.1.0}"
+
 if [ -t 1 ]; then
     C_RESET=$'\033[0m'; C_GREEN=$'\033[32m'; C_RED=$'\033[31m'
     C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
@@ -136,8 +141,8 @@ info "链接资源并生成 R.java (aapt2 link)"
     --java "$OUT_DIR/gen" \
     --min-sdk-version "$MIN_SDK" \
     --target-sdk-version "$TARGET_SDK" \
-    --version-code 1 \
-    --version-name 1.0.0 \
+    --version-code "$VERSION_CODE" \
+    --version-name "$VERSION_NAME" \
     "$OUT_DIR/res-compiled/res.zip"
 
 # ---------------------------------------------------------------- 2. 编译 Java

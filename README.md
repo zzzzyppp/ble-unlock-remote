@@ -72,16 +72,32 @@
 
 1. 把 `dist/BLEUnlockRemote.apk` 传到手机安装（需允许「安装未知来源应用」）
 2. 打开 App，授予蓝牙权限（Android 12+ 会请求「附近的设备」）
-3. 把 Mac 上打印的**配对令牌**粘贴进输入框，点「保存令牌并连接」
+3. 点「＋ 添加 Mac」，填一个备注名，把 Mac 上打印的**配对令牌**粘贴进去
 4. 连上后点中间的大按钮**「解锁」**即可
 
 App 使用前台服务保持连接，所以手机锁屏时也能直接解锁 Mac——不用先解锁手机。
 
+### 管理多台 Mac
+
+一台手机可以保存任意多台 Mac 的密钥，适合「办公室一台、家里一台」这种情况。
+
+- **切换 Mac**：点「切换 Mac」，列表中 `●` 表示当前选中，点一下就切换并自动重连
+- **确认没填错**：每台后面的方括号是密钥指纹（密钥前 4 字节的十六进制），用于区分和核对
+- **重命名 / 改令牌**：「切换 Mac」→「管理 / 删除」→ 选一台 →「重命名 / 修改令牌」
+- **删除**：同一路径下选「删除」，只从手机移除，不影响那台 Mac
+
+同一时刻**只连接选中的那一台**。首次连接需要扫描；连过一次后会记住设备地址，下次直接连接，明显更快。
+
+> **从旧版本升级**：原有的单个令牌会自动迁移成一条名为「我的 Mac」的记录，**不需要重新填写**。
+
 ### APK 信息
 
-- 包名 `com.bleunlock.remote`，versionCode 1
+- 包名 `com.bleunlock.remote`，versionCode 2 / versionName 1.1.0
 - minSdk 26（Android 8.0），targetSdk 34
 - 无第三方依赖，纯系统 API
+
+> 改动功能后记得递增 `versionCode`，否则手机上无法覆盖安装。
+> 默认值在 `build.sh` 里，也可临时指定：`VERSION_CODE=3 VERSION_NAME=1.2.0 ./build.sh`
 
 ---
 
@@ -146,15 +162,28 @@ App 使用前台服务保持连接，所以手机锁屏时也能直接解锁 Mac
 | GATT 服务注册与广播 | 实际运行 | 成功，无异常 |
 | 自包含脚本 | 在无源码目录下解出内嵌源码并独立编译 | 源码一致、编译通过 |
 | 脚本健壮性 | 修复了 zh_CN locale 下 bash 把全角括号并入变量名的解析缺陷（11 处） | 已修复 |
+| 令牌格式解析 | base64 / URL-safe / 大小写十六进制 / 带分隔符 / 各类非法输入（真实 `Protocol` 代码） | 全部符合预期 |
+| 多密钥存储 | 真实 `org.json` 语义下的 JSON 往返、中文与引号反斜杠转义、损坏数据容错 | 通过 |
+| 旧数据迁移 | 单令牌自动迁移为一条记录，令牌保持可用 | 通过 |
+| 真实令牌 | 用 Mac 上实际生成的令牌跑解析与指纹 | 指纹 `1E42CF4D`，32 字节 |
 
 复现命令：
 
 ```bash
 ./verify-protocol.sh                    # 跨语言协议一致性
+./verify-multikey.sh                    # 令牌解析 + 多密钥存储 + 迁移
 ./build/e2e/BLEUnlockCmd --selftest-protocol   # 协议与解锁流程自检
 ```
 
+> `verify-multikey.sh` 需要一点技巧：`android.jar` 里的 `android.util.Base64` 和
+> `org.json` 都是 `throw new RuntimeException("Stub!")` 占位实现，直接跑会抛异常。
+> 因此 `tools/testdoubles/` 下提供了语义一致的**真实替身实现**，放在 classpath
+> 最前面覆盖掉 Stub，从而能在电脑上验证真正的生产代码逻辑。
+
 ### 尚未验证（需要真机）
+
+**多 Mac 界面的实际点击流程**（列表切换、重命名、删除）。这部分只涉及 Android UI
+与 SharedPreferences，已通过逻辑层验证，但界面交互需要你在手机上实际点一遍确认。
 
 **手机与 Mac 之间的实际蓝牙链路**。原因是 macOS 不会把自己发出的广播回报给本机的扫描器，所以同一台 Mac 无法自我验证"手机能否扫描到并连上"。
 
@@ -221,12 +250,19 @@ ble-unlock/
 ├── build-mac.sh                    ← 生成自包含脚本
 ├── android-src/                    ← Android 源码
 │   ├── AndroidManifest.xml
-│   ├── java/com/bleunlock/remote/{Protocol,BleService,MainActivity}.java
+│   ├── java/com/bleunlock/remote/
+│   │   ├── Protocol.java           ← 协议与令牌解析
+│   │   ├── MacEntryStore.java      ← 多台 Mac 的密钥存储
+│   │   ├── BleService.java         ← 前台服务，维持 BLE 连接
+│   │   └── MainActivity.java       ← 界面
 │   └── res/
 ├── build.sh                        ← 构建 APK
 ├── verify-protocol.sh              ← 跨语言协议一致性验证
+├── verify-multikey.sh              ← 令牌解析 / 多密钥存储 / 迁移验证
 ├── tools/
 │   ├── VerifyProtocol.java         ← 协议验证工具
+│   ├── VerifyMultiKey.java         ← 多密钥验证工具
+│   ├── testdoubles/                ← android.jar Stub 的真实替身（仅测试用）
 │   ├── ble-test-client.swift       ← 模拟手机端的测试客户端
 │   └── make_icons.py               ← 生成启动图标
 ├── keystore.jks                    ← APK 签名密钥（勿删）

@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.bleunlock.remote"
-    android:versionCode="1"
-    android:versionName="1.0.0">
+    package="com.bleunlock.remote">
+    <!-- versionCode / versionName 由 build.sh 通过 aapt2 link 注入，便于统一管理版本 -->
 
     <!-- Android 12 (API 31) 及以上 -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"

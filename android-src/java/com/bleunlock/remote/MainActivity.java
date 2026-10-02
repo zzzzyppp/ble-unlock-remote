@@ -2,6 +2,7 @@ package com.bleunlock.remote;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -9,7 +10,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
-import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -20,7 +20,6 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.text.InputType;
 import android.util.TypedValue;
-import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
@@ -34,26 +33,34 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 主界面：一个解锁按钮 + 配对令牌设置 + 连接状态。
+ * 主界面：解锁按钮 + 连接状态 + 多台 Mac 的密钥管理。
+ *
  * 界面完全用代码构建，避免依赖 AppCompat 等第三方库。
  */
 public class MainActivity extends Activity {
 
-    public static final String PREFS = "ble_unlock_prefs";
-    public static final String KEY_TOKEN = "token";
-
     private static final int REQ_PERMISSIONS = 2001;
     private static final int REQ_ENABLE_BT = 2002;
 
+    private static final int COL_BG = 0xFF111418;
+    private static final int COL_CARD = 0xFF1B2027;
+    private static final int COL_TEXT = 0xFFFFFFFF;
+    private static final int COL_MUTED = 0xFF9AA4B2;
+    private static final int COL_GREEN = 0xFF2E7D32;
+    private static final int COL_GREY = 0xFF37474F;
+    private static final int COL_BLUE = 0xFF1565C0;
+    private static final int COL_RED = 0xFFEF5350;
+    private static final int COL_AMBER = 0xFFFFCA28;
+
+    private TextView macNameView;
     private TextView statusView;
     private TextView detailView;
-    private EditText tokenView;
     private Button unlockButton;
     private Button connectButton;
 
+    private MacEntryStore store;
     private BleService service;
     private boolean bound = false;
-    private SharedPreferences prefs;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable uiRefresh = new Runnable() {
@@ -90,14 +97,11 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        store = new MacEntryStore(this);
         setContentView(buildUi());
-
-        String token = prefs.getString(KEY_TOKEN, "");
-        tokenView.setText(token);
-
         registerStateReceiver();
         bindToService();
+        ensureServiceRunning();
     }
 
     @Override
@@ -105,6 +109,7 @@ public class MainActivity extends Activity {
         super.onResume();
         handler.post(uiRefresh);
         ensurePermissions();
+        renderState();
     }
 
     @Override
@@ -134,49 +139,54 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(pad, pad, pad, pad);
-        root.setBackgroundColor(Color.parseColor("#111418"));
+        root.setBackgroundColor(COL_BG);
 
         TextView title = new TextView(this);
         title.setText("BLE Unlock");
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(Color.parseColor("#FFFFFF"));
+        title.setTextColor(COL_TEXT);
         root.addView(title);
 
         TextView subtitle = new TextView(this);
         subtitle.setText("点一下按钮即可解锁你的 Mac");
         subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        subtitle.setTextColor(Color.parseColor("#9AA4B2"));
+        subtitle.setTextColor(COL_MUTED);
         subtitle.setPadding(0, dp(4), 0, dp(18));
         root.addView(subtitle);
 
-        // 状态卡片
+        // ---- 状态卡片 ----
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackgroundColor(Color.parseColor("#1B2027"));
+        card.setBackgroundColor(COL_CARD);
         card.setPadding(dp(16), dp(14), dp(16), dp(14));
 
+        macNameView = new TextView(this);
+        macNameView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        macNameView.setTypeface(Typeface.DEFAULT_BOLD);
+        macNameView.setTextColor(COL_TEXT);
+        card.addView(macNameView);
+
         statusView = new TextView(this);
-        statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        statusView.setTypeface(Typeface.DEFAULT_BOLD);
-        statusView.setTextColor(Color.parseColor("#FFFFFF"));
+        statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        statusView.setPadding(0, dp(6), 0, 0);
         card.addView(statusView);
 
         detailView = new TextView(this);
         detailView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        detailView.setTextColor(Color.parseColor("#9AA4B2"));
+        detailView.setTextColor(COL_MUTED);
         detailView.setPadding(0, dp(4), 0, 0);
         card.addView(detailView);
 
         root.addView(card);
 
-        // 解锁按钮
+        // ---- 解锁按钮 ----
         unlockButton = new Button(this);
         unlockButton.setText("解 锁");
         unlockButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
         unlockButton.setTypeface(Typeface.DEFAULT_BOLD);
         unlockButton.setTextColor(Color.WHITE);
-        unlockButton.setBackgroundColor(Color.parseColor("#2E7D32"));
+        unlockButton.setBackgroundColor(COL_GREEN);
         LinearLayout.LayoutParams unlockLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(96));
         unlockLp.topMargin = dp(18);
@@ -184,7 +194,7 @@ public class MainActivity extends Activity {
         unlockButton.setOnClickListener(v -> doSend(Protocol.CMD_UNLOCK));
         root.addView(unlockButton);
 
-        // 次要按钮
+        // ---- 次要按钮 ----
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
@@ -195,7 +205,7 @@ public class MainActivity extends Activity {
         connectButton = new Button(this);
         connectButton.setText("重新连接");
         connectButton.setTextColor(Color.WHITE);
-        connectButton.setBackgroundColor(Color.parseColor("#37474F"));
+        connectButton.setBackgroundColor(COL_GREY);
         LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         half.rightMargin = dp(5);
@@ -206,7 +216,7 @@ public class MainActivity extends Activity {
         Button lockButton = new Button(this);
         lockButton.setText("锁定 Mac");
         lockButton.setTextColor(Color.WHITE);
-        lockButton.setBackgroundColor(Color.parseColor("#5D4037"));
+        lockButton.setBackgroundColor(0xFF5D4037);
         LinearLayout.LayoutParams half2 = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         half2.leftMargin = dp(5);
@@ -216,46 +226,40 @@ public class MainActivity extends Activity {
 
         root.addView(row);
 
-        // 配对令牌
-        TextView tokenLabel = new TextView(this);
-        tokenLabel.setText("配对令牌（在 Mac 上运行 ./mac-ble-unlock.sh token 获取）");
-        tokenLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        tokenLabel.setTextColor(Color.parseColor("#9AA4B2"));
-        tokenLabel.setPadding(0, dp(24), 0, dp(6));
-        root.addView(tokenLabel);
-
-        tokenView = new EditText(this);
-        tokenView.setHint("32 字节密钥的 base64 或十六进制");
-        tokenView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        tokenView.setTextColor(Color.parseColor("#FFFFFF"));
-        tokenView.setHintTextColor(Color.parseColor("#5A6470"));
-        tokenView.setInputType(InputType.TYPE_CLASS_TEXT
-                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        tokenView.setBackgroundColor(Color.parseColor("#1B2027"));
-        tokenView.setPadding(dp(12), dp(12), dp(12), dp(12));
-        root.addView(tokenView);
-
-        Button saveToken = new Button(this);
-        saveToken.setText("保存令牌并连接");
-        saveToken.setTextColor(Color.WHITE);
-        saveToken.setBackgroundColor(Color.parseColor("#1565C0"));
-        LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
+        // ---- Mac 密钥管理 ----
+        Button switchButton = new Button(this);
+        switchButton.setText("切换 Mac");
+        switchButton.setTextColor(Color.WHITE);
+        switchButton.setBackgroundColor(COL_BLUE);
+        LinearLayout.LayoutParams switchLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        saveLp.topMargin = dp(10);
-        saveToken.setLayoutParams(saveLp);
-        saveToken.setOnClickListener(v -> saveToken());
-        root.addView(saveToken);
+        switchLp.topMargin = dp(10);
+        switchButton.setLayoutParams(switchLp);
+        switchButton.setOnClickListener(v -> showMacPicker());
+        root.addView(switchButton);
+
+        Button addButton = new Button(this);
+        addButton.setText("＋ 添加 Mac");
+        addButton.setTextColor(Color.WHITE);
+        addButton.setBackgroundColor(COL_GREY);
+        LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        addLp.topMargin = dp(8);
+        addButton.setLayoutParams(addLp);
+        addButton.setOnClickListener(v -> showEditDialog(null));
+        root.addView(addButton);
 
         TextView hint = new TextView(this);
-        hint.setText("提示：Mac 端需要开启「辅助功能」权限，并把登录密码存入钥匙串。"
-                + "首次使用请先运行安装脚本完成配置。");
+        hint.setText("每台 Mac 在安装时都会生成自己的配对令牌，"
+                + "在 Mac 上运行 ./mac-ble-unlock.sh token 可查看。"
+                + "这里可以保存多台 Mac，随时切换。");
         hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        hint.setTextColor(Color.parseColor("#6B7684"));
-        hint.setPadding(0, dp(20), 0, 0);
+        hint.setTextColor(0xFF6B7684);
+        hint.setPadding(0, dp(18), 0, 0);
         root.addView(hint);
 
         ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(Color.parseColor("#111418"));
+        scroll.setBackgroundColor(COL_BG);
         scroll.addView(root, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         return scroll;
@@ -265,39 +269,207 @@ public class MainActivity extends Activity {
         return (int) (value * getResources().getDisplayMetrics().density);
     }
 
-    // ------------------------------------------------------------ 交互
+    // ------------------------------------------------------------ Mac 密钥管理
 
-    private void saveToken() {
-        String raw = tokenView.getText().toString();
-        byte[] key = Protocol.parseToken(raw);
-        if (key == null) {
-            Toast.makeText(this, "令牌格式不对：应为 32 字节的 base64 或 64 位十六进制",
-                    Toast.LENGTH_LONG).show();
+    /** 列出所有已保存的 Mac，点击即切换 */
+    private void showMacPicker() {
+        final List<MacEntryStore.Entry> list = store.all();
+        if (list.isEmpty()) {
+            showEditDialog(null);
             return;
         }
-        prefs.edit().putString(KEY_TOKEN, raw.trim()).apply();
-        Toast.makeText(this, "已保存（指纹 " + Protocol.fingerprint(key) + "）",
-                Toast.LENGTH_SHORT).show();
-        restartConnection();
+
+        String selectedId = store.selectedId();
+        String[] labels = new String[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            MacEntryStore.Entry e = list.get(i);
+            byte[] k = e.keyBytes();
+            String mark = e.id.equals(selectedId) ? "● " : "○ ";
+            String fp = k != null ? Protocol.fingerprint(k) : "令牌无效";
+            labels[i] = mark + e.displayName() + "   [" + fp + "]";
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("选择要连接的 Mac")
+                .setItems(labels, (dialog, which) -> selectMac(list.get(which).id))
+                .setNeutralButton("管理 / 删除", (dialog, which) -> showManageDialog())
+                .setNegativeButton("取消", null)
+                .show();
     }
 
+    private void showManageDialog() {
+        final List<MacEntryStore.Entry> list = store.all();
+        if (list.isEmpty()) {
+            Toast.makeText(this, "还没有保存任何 Mac", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String[] labels = new String[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            labels[i] = list.get(i).displayName();
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("管理已保存的 Mac")
+                .setItems(labels, (dialog, which) -> showEntryActions(list.get(which)))
+                .setNegativeButton("返回", null)
+                .show();
+    }
+
+    private void showEntryActions(final MacEntryStore.Entry entry) {
+        String[] actions = {"重命名 / 修改令牌", "删除"};
+        new AlertDialog.Builder(this)
+                .setTitle(entry.displayName())
+                .setItems(actions, (dialog, which) -> {
+                    if (which == 0) {
+                        showEditDialog(entry);
+                    } else {
+                        confirmDelete(entry);
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void confirmDelete(final MacEntryStore.Entry entry) {
+        new AlertDialog.Builder(this)
+                .setTitle("删除 " + entry.displayName() + "？")
+                .setMessage("只从手机里移除这条配对信息，不会影响那台 Mac 本身。")
+                .setPositiveButton("删除", (dialog, which) -> {
+                    boolean wasSelected = entry.id.equals(store.selectedId());
+                    store.delete(entry.id);
+                    Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show();
+                    if (wasSelected) {
+                        MacEntryStore.Entry next = store.selected();
+                        if (next != null) selectMac(next.id);
+                    }
+                    renderState();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 新增（entry 为 null）或编辑已有的 Mac */
+    private void showEditDialog(final MacEntryStore.Entry entry) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(20);
+        box.setPadding(pad, dp(8), pad, 0);
+
+        TextView nameLabel = new TextView(this);
+        nameLabel.setText("备注名（随便起，用于区分多台 Mac）");
+        nameLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        nameLabel.setTextColor(COL_MUTED);
+        box.addView(nameLabel);
+
+        final EditText nameInput = new EditText(this);
+        nameInput.setHint("例如：办公室 iMac");
+        nameInput.setSingleLine(true);
+        nameInput.setText(entry != null ? entry.name : "");
+        box.addView(nameInput);
+
+        TextView tokenLabel = new TextView(this);
+        tokenLabel.setText("配对令牌（在 Mac 上运行 ./mac-ble-unlock.sh token 获取）");
+        tokenLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tokenLabel.setTextColor(COL_MUTED);
+        tokenLabel.setPadding(0, dp(14), 0, 0);
+        box.addView(tokenLabel);
+
+        final EditText tokenInput = new EditText(this);
+        tokenInput.setHint("32 字节密钥的 base64 或十六进制");
+        tokenInput.setSingleLine(true);
+        tokenInput.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        tokenInput.setText(entry != null ? entry.token : "");
+        box.addView(tokenInput);
+
+        new AlertDialog.Builder(this)
+                .setTitle(entry == null ? "添加 Mac" : "编辑 Mac")
+                .setView(box)
+                .setPositiveButton("保存", (dialog, which) -> {
+                    String name = nameInput.getText().toString().trim();
+                    String token = tokenInput.getText().toString().trim();
+                    byte[] key = Protocol.parseToken(token);
+                    if (key == null) {
+                        Toast.makeText(this,
+                                "令牌格式不对：应为 32 字节的 base64 或 64 位十六进制",
+                                Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    if (name.isEmpty()) {
+                        name = "Mac " + Protocol.fingerprint(key);
+                    }
+                    if (entry == null) {
+                        String id = store.add(name, token);
+                        Toast.makeText(this, "已添加 " + name, Toast.LENGTH_SHORT).show();
+                        selectMac(id);
+                    } else {
+                        store.update(entry.id, name, token);
+                        Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show();
+                        if (entry.id.equals(store.selectedId())) {
+                            restartConnection();
+                        }
+                        renderState();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void selectMac(String id) {
+        store.select(id);
+        MacEntryStore.Entry e = store.find(id);
+        if (e != null) {
+            Toast.makeText(this, "已切换到 " + e.displayName(), Toast.LENGTH_SHORT).show();
+        }
+        Intent intent = new Intent(this, BleService.class);
+        intent.setAction(BleService.ACTION_SELECT);
+        startServiceSafely(intent);
+        renderState();
+    }
+
+    // ------------------------------------------------------------ 交互
+
     private void restartConnection() {
+        if (store.isEmpty()) {
+            showEditDialog(null);
+            return;
+        }
         Intent stop = new Intent(this, BleService.class);
         stop.setAction(BleService.ACTION_STOP);
         startService(stop);
 
         Intent start = new Intent(this, BleService.class);
         start.setAction(BleService.ACTION_START);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(start);
-        } else {
-            startService(start);
-        }
+        startServiceSafely(start);
+
         handler.postDelayed(this::bindToService, 300);
         Toast.makeText(this, "正在重新连接…", Toast.LENGTH_SHORT).show();
     }
 
+    private void ensureServiceRunning() {
+        if (store.isEmpty()) return;
+        Intent start = new Intent(this, BleService.class);
+        start.setAction(BleService.ACTION_START);
+        startServiceSafely(start);
+    }
+
+    private void startServiceSafely(Intent intent) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+        } catch (IllegalStateException e) {
+            Toast.makeText(this, "无法启动后台服务：" + e.getMessage(),
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
     private void doSend(byte command) {
+        if (store.isEmpty()) {
+            showEditDialog(null);
+            return;
+        }
         if (service == null) {
             Toast.makeText(this, "服务尚未就绪，请稍候", Toast.LENGTH_SHORT).show();
             return;
@@ -335,25 +507,40 @@ public class MainActivity extends Activity {
     }
 
     private void renderState() {
-        String state = BleService.getState();
-        String detail = BleService.getDetail();
+        MacEntryStore.Entry active = store.selected();
 
+        if (active == null) {
+            macNameView.setText("尚未配置 Mac");
+            macNameView.setTextColor(COL_AMBER);
+            statusView.setText("点下方「＋ 添加 Mac」开始");
+            statusView.setTextColor(COL_MUTED);
+            detailView.setText("");
+            unlockButton.setEnabled(false);
+            unlockButton.setBackgroundColor(COL_GREY);
+            connectButton.setText("重新连接");
+            return;
+        }
+
+        String pos = store.positionLabel(active.id);
+        macNameView.setText("当前：" + active.displayName()
+                + (pos.isEmpty() ? "" : "   (" + pos + ")"));
+        macNameView.setTextColor(COL_TEXT);
+
+        String state = BleService.getState();
         statusView.setText(state);
-        detailView.setText(detail);
+        detailView.setText(BleService.getDetail());
 
         if (BleService.STATE_CONNECTED.equals(state)) {
-            statusView.setTextColor(Color.parseColor("#66BB6A"));
-            unlockButton.setEnabled(true);
-            unlockButton.setBackgroundColor(Color.parseColor("#2E7D32"));
+            statusView.setTextColor(0xFF66BB6A);
+            unlockButton.setBackgroundColor(COL_GREEN);
         } else if (BleService.STATE_ERROR.equals(state)) {
-            statusView.setTextColor(Color.parseColor("#EF5350"));
-            unlockButton.setEnabled(true);
-            unlockButton.setBackgroundColor(Color.parseColor("#37474F"));
+            statusView.setTextColor(COL_RED);
+            unlockButton.setBackgroundColor(COL_GREY);
         } else {
-            statusView.setTextColor(Color.parseColor("#FFCA28"));
-            unlockButton.setEnabled(true);
-            unlockButton.setBackgroundColor(Color.parseColor("#37474F"));
+            statusView.setTextColor(COL_AMBER);
+            unlockButton.setBackgroundColor(COL_GREY);
         }
+        unlockButton.setEnabled(true);
         connectButton.setText(BleService.STATE_SCANNING.equals(state) ? "搜索中…" : "重新连接");
     }
 
