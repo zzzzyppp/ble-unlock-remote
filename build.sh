@@ -22,9 +22,42 @@ cd "$SCRIPT_DIR"
 SRC_DIR="$SCRIPT_DIR/android-src"
 OUT_DIR="$SCRIPT_DIR/build"
 DIST_DIR="$SCRIPT_DIR/dist"
-KEYSTORE="$SCRIPT_DIR/keystore.jks"
-KEYSTORE_PASS_FILE="$SCRIPT_DIR/.keystore-pass"
+
+# ---------------------------------------------------------------- 签名密钥位置
+#
+# 密钥刻意放在项目目录之外，避免被误删或误提交：
+#   1. 环境变量 BLEUNLOCK_KEYSTORE_DIR 指定的目录
+#   2. ~/.config/ble-unlock/            （默认，推荐）
+#   3. 项目目录                          （兼容早期版本，仍然可用）
+#
+# 密钥丢了就无法对已安装的 APK 做覆盖升级（只能卸载重装），所以请一并备份。
 KEY_ALIAS="bleunlock"
+KEYSTORE_DIR=""
+KEYSTORE=""
+KEYSTORE_PASS_FILE=""
+
+locate_keystore() {
+    local candidates=()
+    [ -n "${BLEUNLOCK_KEYSTORE_DIR:-}" ] && candidates+=("$BLEUNLOCK_KEYSTORE_DIR")
+    candidates+=("$HOME/.config/ble-unlock")
+    candidates+=("$SCRIPT_DIR")
+
+    local dir
+    for dir in "${candidates[@]}"; do
+        if [ -f "$dir/keystore.jks" ]; then
+            KEYSTORE_DIR="$dir"
+            KEYSTORE="$dir/keystore.jks"
+            KEYSTORE_PASS_FILE="$dir/.keystore-pass"
+            return 0
+        fi
+    done
+
+    # 一个都没有：在首选位置新建
+    KEYSTORE_DIR="${BLEUNLOCK_KEYSTORE_DIR:-$HOME/.config/ble-unlock}"
+    KEYSTORE="$KEYSTORE_DIR/keystore.jks"
+    KEYSTORE_PASS_FILE="$KEYSTORE_DIR/.keystore-pass"
+    return 1
+}
 
 COMPILE_SDK="android-34"
 # 注意：build-tools 34.0.0 自带的 d8 在转换本项目代码时会内部报错（R8 的 NPE），
@@ -113,6 +146,11 @@ done
 export ANDROID_USER_HOME="${ANDROID_USER_HOME:-$SCRIPT_DIR/toolchain/android-home}"
 mkdir -p "$ANDROID_USER_HOME"
 
+# 定位（或准备新建）签名密钥
+if locate_keystore; then
+    :
+fi
+
 if [ "${1:-}" = "clean" ]; then
     rm -rf "$OUT_DIR" "$DIST_DIR"
     ok "已清理 build/ 与 dist/"
@@ -122,6 +160,11 @@ fi
 info "JDK:       $JAVA_HOME"
 info "SDK:       $SDK_ROOT"
 info "build-tools: $BUILD_TOOLS_VERSION / platform $COMPILE_SDK"
+if [ -f "$KEYSTORE" ]; then
+    info "签名密钥:   $KEYSTORE"
+else
+    info "签名密钥:   尚不存在，将在 $KEYSTORE_DIR 新建"
+fi
 
 # ---------------------------------------------------------------- 清理
 
@@ -185,8 +228,10 @@ cp "$OUT_DIR/base.apk" "$OUT_DIR/unsigned.apk"
 # ---------------------------------------------------------------- 5. 签名
 
 if [ ! -f "$KEYSTORE" ]; then
-    info "生成签名密钥 (keystore.jks)"
+    info "生成签名密钥 ($KEYSTORE)"
     # 固定密码：这是自用侧载包，不需要保密；保留密钥库是为了后续能覆盖安装升级
+    mkdir -p "$KEYSTORE_DIR"
+    chmod 700 "$KEYSTORE_DIR" 2>/dev/null || true
     if [ ! -f "$KEYSTORE_PASS_FILE" ]; then
         printf 'bleunlock' > "$KEYSTORE_PASS_FILE"
         chmod 600 "$KEYSTORE_PASS_FILE"
@@ -199,9 +244,14 @@ if [ ! -f "$KEYSTORE" ]; then
         -storepass "$STORE_PASS" -keypass "$STORE_PASS" \
         -dname "CN=BLE Unlock, OU=Self-signed, O=BLEUnlock, L=, S=, C=" \
         >/dev/null 2>&1 || die "生成密钥库失败"
-    ok "已生成 keystore.jks（请保留它，否则以后无法覆盖安装升级）"
+    chmod 600 "$KEYSTORE" 2>/dev/null || true
+    echo
+    warn "已在 $KEYSTORE_DIR 新建签名密钥"
+    warn "请务必备份该目录：密钥丢失后无法对已安装的 APK 做覆盖升级。"
+    echo
 fi
 
+[ -f "$KEYSTORE_PASS_FILE" ] || die "缺少密钥库口令文件：$KEYSTORE_PASS_FILE"
 STORE_PASS="$(cat "$KEYSTORE_PASS_FILE")"
 info "签名 APK (apksigner)"
 "$APKSIGNER" sign \

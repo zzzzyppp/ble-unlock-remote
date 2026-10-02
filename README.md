@@ -15,9 +15,32 @@
 |---|---|
 | `dist/BLEUnlockRemote.apk` | 手机端安装包（已签名，可直接侧载安装） |
 | `mac-ble-unlock.sh` | Mac 端一键安装脚本（自包含，内嵌 Swift 源码，无需其他文件） |
-| `keystore.jks` | APK 签名密钥，**请勿删除**，否则以后无法覆盖安装升级 |
+| `~/.config/ble-unlock/` | APK 签名密钥，**在项目目录之外**，请一并备份（见下） |
 
 源码与构建脚本也都在本目录，可随时修改重新构建。
+
+### 签名密钥的位置
+
+签名密钥**刻意不放在项目目录里**，避免被误删或误提交。`build.sh` 按以下顺序查找：
+
+1. 环境变量 `BLEUNLOCK_KEYSTORE_DIR` 指定的目录
+2. `~/.config/ble-unlock/` ← 默认（`keystore.jks` 与 `.keystore-pass`，权限 600，目录 700）
+3. 项目目录（兼容早期版本，仍然可用）
+
+一个都找不到时会自动在 `~/.config/ble-unlock/` 新建并提醒你备份。
+
+> **密钥丢了就无法对已安装的 APK 做覆盖升级**（只能卸载重装，App 数据会清空）。
+> 建议把 `~/.config/ble-unlock/` 整个目录备份到你自己的密码管理器里。
+>
+> 当前签名指纹：`9D:23:19:BA:A8:08:01:66:...:8B:80:E6:1E`
+>
+> 随时可用这条命令核对密钥是否完好、指纹是否一致：
+> ```bash
+> keytool -list -keystore ~/.config/ble-unlock/keystore.jks \
+>   -storepass "$(cat ~/.config/ble-unlock/.keystore-pass)" | grep SHA-256
+> ```
+> （`keytool` 来自 JDK；如果没装 JDK，可用项目里的
+> `./toolchain/jdk-*/Contents/Home/bin/keytool`。）
 
 ---
 
@@ -265,6 +288,12 @@ ble-unlock/
 │   ├── testdoubles/                ← android.jar Stub 的真实替身（仅测试用）
 │   ├── ble-test-client.swift       ← 模拟手机端的测试客户端
 │   └── make_icons.py               ← 生成启动图标
-├── keystore.jks                    ← APK 签名密钥（勿删）
 └── toolchain/                      ← 便携 JDK 与 Android SDK（可删）
+
+~/.config/ble-unlock/               ← APK 签名密钥（项目之外，注意备份）
+├── keystore.jks
+└── .keystore-pass
 ```
+
+> 项目目录里**没有**任何密钥文件。`keystore.jks` 与 `.keystore-pass` 都在
+> `~/.config/ble-unlock/`，`.gitignore` 里也同时保留了对应规则以防万一。
