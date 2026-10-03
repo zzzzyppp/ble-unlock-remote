@@ -1,17 +1,32 @@
-# BLE Unlock — 用手机点一下解锁 Mac
+# BLE Unlock
 
-手机 App 通过低功耗蓝牙（BLE）发一条带签名的指令给 Mac，Mac 校验通过后自动输入登录密码解锁屏幕。
+**用手机点一下，解锁你的 Mac。** 不用走过去按指纹，也不用输密码。
 
-解锁机制与开源项目 [BLEUnlock](https://github.com/ts1/BLEUnlock) 相同：读取钥匙串里的登录密码，用 `CGEvent` 合成键盘输入到锁屏界面。因此 **Mac 端必须获得「辅助功能」权限**，且**只适用于密码登录**（无法用 Touch ID）。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform: macOS 11+](https://img.shields.io/badge/macOS-11%2B-black.svg)](#系统要求)
+[![Platform: Android 8+](https://img.shields.io/badge/Android-8.0%2B-3DDC84.svg)](#系统要求)
+[![Release](https://img.shields.io/github/v/release/zzzzyppp/ble-unlock-remote)](https://github.com/zzzzyppp/ble-unlock-remote/releases/latest)
 
-> 蓝牙通信协议、配对认证（HMAC-SHA256）与防重放设计为本项目自有实现，
-> 详见 [LICENSE](LICENSE) 的致谢部分。
+手机通过低功耗蓝牙（BLE）向 Mac 发送一条带 **HMAC-SHA256 签名**的指令，Mac 校验通过后
+自动输入登录密码解锁屏幕。一台手机可以保存多台 Mac 的密钥，随时切换。
+
+---
+
+## 特性
+
+- **一键解锁** —— 手机点一下，Mac 自动解锁，响应约 1 秒
+- **手机锁屏也能用** —— 前台服务保持 BLE 连接，不必先解锁手机
+- **支持多台 Mac** —— 每台各自一个令牌，App 内切换
+- **指令有签名** —— HMAC-SHA256 认证 + nonce 防重放 + 时间戳校验
+- **密码不出本机** —— 存于 macOS 钥匙串，不经蓝牙传输，不写入配置文件
+- **Mac 端零依赖** —— 单个自包含脚本，编译 + 配置 + 开机自启一次完成
+- **无 Gradle、无第三方库** —— APK 直接调用 aapt2/javac/d8/apksigner 构建
 
 ---
 
 ## 下载
 
-**直接从 [Releases](https://github.com/zzzzyppp/ble-unlock-remote/releases/latest) 下载**：
+**从 [Releases](https://github.com/zzzzyppp/ble-unlock-remote/releases/latest) 下载**：
 
 | 文件 | 用途 |
 |---|---|
@@ -19,130 +34,70 @@
 | `mac-ble-unlock.sh` | Mac 端一键安装脚本（自包含，无需其他文件） |
 | `SHA256SUMS.txt` | 校验值，可选 |
 
-安装步骤见 release 说明，或继续往下读。
-
-> ⚠️ **请勿把 `mac-ble-unlock.sh` 分享给他人。** 手机 App 里内置了从脚本推导密钥的
-> 算法，同时拿到脚本和 APK 的人可以推算出你的配对密钥，进而伪造解锁指令。
-> 请把这两个文件当作密码一样保管。
-
----
-
-## 交付物
-
-| 文件 | 说明 |
-|---|---|
-| `dist/BLEUnlockRemote.apk` | 手机端安装包（已签名，可直接侧载安装） |
-| `mac-ble-unlock.sh` | Mac 端一键安装脚本（自包含，内嵌 Swift 源码，无需其他文件） |
-| `~/.config/ble-unlock/` | APK 签名密钥，**在项目目录之外**，请一并备份（见下） |
-
-源码与构建脚本也都在本目录，可随时修改重新构建。
-
-### 签名密钥的位置
-
-签名密钥**刻意不放在项目目录里**，避免被误删或误提交。`build.sh` 按以下顺序查找：
-
-1. 环境变量 `BLEUNLOCK_KEYSTORE_DIR` 指定的目录
-2. `~/.config/ble-unlock/` ← 默认（`keystore.jks` 与 `.keystore-pass`，权限 600，目录 700）
-3. 项目目录（兼容早期版本，仍然可用）
-
-一个都找不到时会自动在 `~/.config/ble-unlock/` 新建并提醒你备份。
-
-> **密钥丢了就无法对已安装的 APK 做覆盖升级**（只能卸载重装，App 数据会清空）。
-> 建议把 `~/.config/ble-unlock/` 整个目录备份到你自己的密码管理器里。
->
-> 建议把你自己的签名指纹记下来，方便日后核对密钥是否还是同一把：
-> ```bash
-> keytool -list -keystore ~/.config/ble-unlock/keystore.jks \
->   -storepass "$(cat ~/.config/ble-unlock/.keystore-pass)" | grep SHA-256
-> ```
-> （`keytool` 来自 JDK；没装 JDK 的话用项目里的
-> `./toolchain/jdk-*/Contents/Home/bin/keytool`。）
->
-> 只要指纹不变，就能一直覆盖安装升级；换了密钥就必须先卸载旧版。
-
----
-
-## 一、Mac 端
-
-### 安装
+校验下载内容：
 
 ```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+---
+
+## 快速开始
+
+### 1. Mac 端
+
+需要 Swift 编译器（仅编译用）。若未安装：
+
+```bash
+xcode-select --install
+```
+
+安装：
+
+```bash
+chmod +x mac-ble-unlock.sh
 ./mac-ble-unlock.sh install
 ```
 
-脚本会依次完成：
+脚本会依次：编译服务端 → 生成该机器**专属**的配对密钥 → 提示输入**本机登录密码**
+（存入钥匙串）→ 引导授权「辅助功能」→ 注册开机自启，最后打印**配对令牌**。
 
-1. 编译 Swift 服务端，打包成 `~/Library/Application Support/BLEUnlockCmd/BLEUnlockCmd.app`
-2. 生成 32 字节配对密钥（写入 `config.json`，权限 600）
-3. 提示输入登录密码并存入**钥匙串**（服务名 `ble-unlock-cmd`）
-4. 引导你授予「辅助功能」权限
-5. 注册 LaunchAgent 实现开机自启
-
-安装结束会打印**配对令牌**，手机 App 需要填这个值。
-
-### 常用命令
+装完自检：
 
 ```bash
-./mac-ble-unlock.sh token        # 再次显示配对令牌
-./mac-ble-unlock.sh status       # 查看运行状态、权限、最近日志
-./mac-ble-unlock.sh check        # 自检（权限 / 密码 / 锁屏状态）
-./mac-ble-unlock.sh log          # 实时日志
-./mac-ble-unlock.sh restart      # 重启服务
-./mac-ble-unlock.sh set-password # 改了登录密码后重新写入钥匙串
-./mac-ble-unlock.sh uninstall    # 卸载
+./mac-ble-unlock.sh status     # 服务状态、权限、最近日志
+./mac-ble-unlock.sh token      # 再次显示配对令牌
 ```
 
-### 需要授权的两项
+### 2. 手机端
+
+1. 安装 `BLEUnlockRemote.apk`（需允许「安装未知来源应用」）
+2. 打开 App，授予蓝牙权限（Android 12+ 会请求「附近的设备」）
+3. 点「＋ 添加 Mac」，填备注名，粘贴 Mac 上打印的**配对令牌**
+4. 点中间的大按钮「解锁」
+
+### 3. 多台 Mac
+
+每台 Mac 各自跑一次安装脚本、各自得到令牌，在 App 里「＋ 添加 Mac」逐台加入。
+用「切换 Mac」切换，`●` 表示当前连接的那台。同一时刻只连接选中的那一台。
+
+---
+
+## 必须授权的两项
 
 | 权限 | 位置 | 不授权的后果 |
 |---|---|---|
 | 辅助功能 | 系统设置 → 隐私与安全性 → 辅助功能 | 无法注入密码，解锁静默失败 |
 | 蓝牙 | 首次运行会弹窗 | 无法广播，手机找不到 Mac |
 
-> 若钥匙串弹出访问请求，务必选**「始终允许」**——锁屏状态下没人能点确认。
-
-### 关于休眠
-
-服务端运行时会创建一个"防空闲休眠"断言，防止系统休眠导致蓝牙广播停止（**显示器仍会正常息屏，屏保和锁定不受影响**）。这是可用的前提：Mac 一旦真正休眠，BLE 广播就停了，手机不可能唤醒它。
-
-如果希望允许系统休眠，可编辑 LaunchAgent 后自行调整；代价是休眠后手机点解锁没有反应。
+> 钥匙串若弹出访问请求，务必选**「始终允许」**——锁屏状态下没人能点确认。
 
 ---
 
-## 二、手机端
+## 工作原理
 
-1. 把 `dist/BLEUnlockRemote.apk` 传到手机安装（需允许「安装未知来源应用」）
-2. 打开 App，授予蓝牙权限（Android 12+ 会请求「附近的设备」）
-3. 点「＋ 添加 Mac」，填一个备注名，把 Mac 上打印的**配对令牌**粘贴进去
-4. 连上后点中间的大按钮**「解锁」**即可
-
-App 使用前台服务保持连接，所以手机锁屏时也能直接解锁 Mac——不用先解锁手机。
-
-### 管理多台 Mac
-
-一台手机可以保存任意多台 Mac 的密钥，适合「办公室一台、家里一台」这种情况。
-
-- **切换 Mac**：点「切换 Mac」，列表中 `●` 表示当前选中，点一下就切换并自动重连
-- **确认没填错**：每台后面的方括号是密钥指纹（密钥前 4 字节的十六进制），用于区分和核对
-- **重命名 / 改令牌**：「切换 Mac」→「管理 / 删除」→ 选一台 →「重命名 / 修改令牌」
-- **删除**：同一路径下选「删除」，只从手机移除，不影响那台 Mac
-
-同一时刻**只连接选中的那一台**。首次连接需要扫描；连过一次后会记住设备地址，下次直接连接，明显更快。
-
-> **从旧版本升级**：原有的单个令牌会自动迁移成一条名为「我的 Mac」的记录，**不需要重新填写**。
-
-### APK 信息
-
-- 包名 `com.bleunlock.remote`，versionCode 2 / versionName 1.1.0
-- minSdk 26（Android 8.0），targetSdk 34
-- 无第三方依赖，纯系统 API
-
-> 改动功能后记得递增 `versionCode`，否则手机上无法覆盖安装。
-> 默认值在 `build.sh` 里，也可临时指定：`VERSION_CODE=3 VERSION_NAME=1.2.0 ./build.sh`
-
----
-
-## 三、工作原理
+解锁机制与开源项目 [BLEUnlock](https://github.com/ts1/BLEUnlock) 相同：
+读取钥匙串中的登录密码，用 `CGEvent` 合成键盘输入到锁屏界面。
 
 ```
 ┌──────────────┐                      ┌────────────────────────────┐
@@ -174,94 +129,128 @@ App 使用前台服务保持连接，所以手机锁屏时也能直接解锁 Mac
 | 28 | 2 | 保留（0） |
 | 30 | 32 | `HMAC-SHA256(前 30 字节)` |
 
-服务 UUID `B1E0A100-0001-4A00-8000-00805F9B0001`；指令特征 `...-0002-...`；状态特征 `...-0003-...`；信息特征 `...-0004-...`。
+服务 UUID `B1E0A100-0001-4A00-8000-00805F9B0001`；指令特征 `...-0002-...`；
+状态特征 `...-0003-...`；信息特征 `...-0004-...`。
 
 ### 安全设计
 
-- **认证**：HMAC-SHA256 + 32 字节预共享密钥。没有令牌无法伪造指令，且无法从空口抓包反推密钥。
+- **认证**：HMAC-SHA256 + 32 字节预共享密钥。没有令牌无法伪造指令，
+  也无法从空口抓包反推密钥。
 - **防重放**：16 字节随机 nonce + 5 分钟缓存去重；时间戳偏差超过 ±120 秒直接拒绝。
 - **常量时间比较** HMAC，避免时序侧信道。
 - **密码只在本地**：存于 macOS 钥匙串，不经过蓝牙、不落配置文件。
 
-> 注意：BLE 链路本身未加密（未做配对绑定），但指令的**真实性**由 HMAC 保证。攻击者能嗅探到"有一条解锁指令在传输"这个事实，但无法伪造或重放。
+---
+
+## ⚠️ 安全须知
+
+**本项目把"输入密码"这件事自动化了，请理解它的安全边界后再使用。**
+
+### 1. 密钥推导：请勿公开分发你自己的构建产物
+
+手机 App 内置了从 `mac-ble-unlock.sh` 推导密钥的算法。
+**同时拿到「你自己构建的脚本」和「APK」的人，可以推算出你的配对密钥**，
+进而伪造解锁指令。
+
+- 从本仓库下载的官方文件**不含任何人的密钥**（密钥是每台 Mac 安装时在本机生成的）
+- 但如果你把它**当作产品分发给别人**，等于把解锁能力一起给了对方
+
+请把这两样东西当作密码保管。本项目的定位是**自用工具**。
+
+### 2. 它无法抵御的攻击
+
+- **能物理接触你 Mac 的攻击者**：本项目依赖 macOS 的辅助功能与钥匙串，
+  不改变这些信任边界
+- **BLE 嗅探者**：能看到"有一条解锁指令在传输"，但无法伪造或重放
+  （指令真实性由 HMAC 保证；链路本身未加密，未做配对绑定）
+
+### 3. 已知限制
+
+- 仅支持**密码登录**，无法用 Touch ID / Apple Watch 解锁（合成按键无法替代生物识别）
+- 服务端运行时会阻止**系统空闲休眠**，以保证蓝牙广播不被中断
+  （显示器仍会正常息屏、锁定；屏保不受影响）
+- Mac 真正休眠后蓝牙广播会停止，此时手机点解锁不会有反应
 
 ---
 
-## 四、已验证 / 未验证
+## 系统要求
 
-### 已经在本机验证通过
+| | |
+|---|---|
+| macOS | 11 及以上（服务端） |
+| Android | 8.0 及以上（minSdk 26，targetSdk 34） |
+| Swift | Xcode Command Line Tools（仅编译用） |
+
+---
+
+## 已验证 / 未验证
+
+### 已经验证通过
 
 | 项目 | 方法 | 结果 |
 |---|---|---|
-| Mac 端编译 | `swiftc -O` | 通过 |
-| Android 端编译 | aapt2 + javac + d8 + apksigner | 通过，APK 已签名 |
 | 两端协议一致性 | 同一测试向量下 Java 与 Swift 的 HMAC 逐字节比对 | 完全一致 |
 | HMAC 算法正确性 | RFC 4231 官方向量 + 独立 Python 实现交叉验证 | 通过 |
 | 报文校验 | 篡改 HMAC / 错误密钥 / 错魔数 / 过短包 / 过期时间戳 | 全部正确拒绝 |
-| 防重放 | 同 nonce 二次发送 | 正确拒绝（ERR_REPLAY） |
-| 解锁流程 | dry-run 模式走完整链路 | 行为符合预期 |
-| GATT 服务注册与广播 | 实际运行 | 成功，无异常 |
-| 自包含脚本 | 在无源码目录下解出内嵌源码并独立编译 | 源码一致、编译通过 |
-| 脚本健壮性 | 修复了 zh_CN locale 下 bash 把全角括号并入变量名的解析缺陷（11 处） | 已修复 |
-| 令牌格式解析 | base64 / URL-safe / 大小写十六进制 / 带分隔符 / 各类非法输入（真实 `Protocol` 代码） | 全部符合预期 |
-| 多密钥存储 | 真实 `org.json` 语义下的 JSON 往返、中文与引号反斜杠转义、损坏数据容错 | 通过 |
+| 防重放 | 同 nonce 二次发送 | 正确拒绝（`ERR_REPLAY`） |
+| 令牌解析 | base64 / URL-safe / 大小写十六进制 / 带分隔符 / 各类非法输入 | 符合预期 |
+| 多密钥存储 | 真实 `org.json` 语义下的往返、转义、损坏数据容错 | 通过 |
 | 旧数据迁移 | 单令牌自动迁移为一条记录，令牌保持可用 | 通过 |
-| 真实令牌 | 用 Mac 上实际生成的令牌跑解析与指纹 | 通过（32 字节，指纹已脱敏） |
+| 解锁流程 | dry-run 模式走完整链路 | 行为符合预期 |
+| 真机闭环 | 手机 → BLE → Mac → 注入密码 → 解锁成功 | 成功（日志 `解锁结果: OK`） |
+| GATT 注册与广播 | 实际运行 | 成功，无异常 |
+| APK 构建与签名 | aapt2 + javac + d8 + apksigner | 通过 |
 
 复现命令：
 
 ```bash
-./verify-protocol.sh                    # 跨语言协议一致性
-./verify-multikey.sh                    # 令牌解析 + 多密钥存储 + 迁移
+./verify-protocol.sh       # 跨语言协议一致性
+./verify-multikey.sh       # 令牌解析 / 多密钥存储 / 迁移
 ./build/e2e/BLEUnlockCmd --selftest-protocol   # 协议与解锁流程自检
 ```
 
-> `verify-multikey.sh` 需要一点技巧：`android.jar` 里的 `android.util.Base64` 和
+> `verify-multikey.sh` 需要一点技巧：`android.jar` 里的 `android.util.Base64` 与
 > `org.json` 都是 `throw new RuntimeException("Stub!")` 占位实现，直接跑会抛异常。
-> 因此 `tools/testdoubles/` 下提供了语义一致的**真实替身实现**，放在 classpath
-> 最前面覆盖掉 Stub，从而能在电脑上验证真正的生产代码逻辑。
+> 因此 `tools/testdoubles/` 提供了语义一致的**真实替身实现**覆盖掉 Stub，
+> 从而能在电脑上验证真正的生产代码逻辑。
 
-### 尚未验证（需要真机）
+### 尚未验证
 
-**多 Mac 界面的实际点击流程**（列表切换、重命名、删除）。这部分只涉及 Android UI
-与 SharedPreferences，已通过逻辑层验证，但界面交互需要你在手机上实际点一遍确认。
-
-**手机与 Mac 之间的实际蓝牙链路**。原因是 macOS 不会把自己发出的广播回报给本机的扫描器，所以同一台 Mac 无法自我验证"手机能否扫描到并连上"。
-
-服务端已确认在正常广播（`正在广播，等待手机连接`），但**扫描 → 连接 → 写入 → 收到 OK** 这最后一段需要你用真机确认。
-
-如果手机搜不到 Mac，见下节排查。
+- **多台 Mac 的界面点击流程**（列表切换、重命名、删除）：逻辑层已验证，
+  界面交互需要真机确认
+- **macOS 大版本升级后的兼容性**：使用了 `login.framework` 私有 API 锁屏
+  （带屏保回退），大版本升级后建议重新验证
 
 ---
 
-## 五、排查
+## 排查
 
 ### 手机 App 一直显示"扫描中"
 
 1. 确认 Mac 服务端在跑：`./mac-ble-unlock.sh status`
 2. 确认 Mac 蓝牙已开启（系统设置 → 蓝牙）
-3. 确认没在 `log` 里看到 `广播失败`
-4. 看 App 里的「重新连接」，或重启服务端后重试
-5. 安卓的省电策略可能杀掉后台服务：在 设置 → 应用 → BLE Unlock → 电池 里设为「不受限制」
+3. 确认日志里没有 `广播失败`
+4. 点 App 里的「重新连接」，或重启服务端后重试
+5. 安卓省电策略可能杀掉后台服务：设置 → 应用 → BLE Unlock → 电池 → 设为「不受限制」
 
 ### 显示"指令已送达 Mac"但 Mac 没解锁
 
 按可能性排序：
 
-1. **缺辅助功能权限** —— `./mac-ble-unlock.sh check` 看这一项
+1. **缺辅助功能权限** —— `./mac-ble-unlock.sh check`
 2. **钥匙串里没密码** —— 同上；或运行 `set-password`
-3. **Mac 屏幕本来就没锁** —— 会返回 `NOT_LOCKED`，这是正常的
+3. **Mac 屏幕本来就没锁** —— 会返回 `NOT_LOCKED`，属正常
 4. **配对令牌不一致** —— 会返回 `ERR_HMAC`
 5. **手机与 Mac 时间差太多** —— 会返回 `ERR_TIME`，校准手机时间
 6. 直接看日志：`./mac-ble-unlock.sh log`
 
 ### 提示密码验证失败
 
-登录密码改过之后需要重新写入：`./mac-ble-unlock.sh set-password`
+改过登录密码后需重新写入：`./mac-ble-unlock.sh set-password`
 
 ---
 
-## 六、从源码重新构建
+## 从源码构建
 
 ```bash
 # Mac 端（修改 mac-src/main.swift 后）
@@ -273,17 +262,27 @@ export ANDROID_SDK_ROOT="$PWD/toolchain/android-sdk"
 ```
 
 `build.sh` 不依赖 Gradle，直接调用 aapt2 / javac / d8 / apksigner，离线可构建。
-工具链（JDK、Android SDK）在 `toolchain/` 下，可随时删除，删除后用系统或环境变量里的工具链也能构建。
+需要 JDK 17+ 与 Android SDK（`platforms/android-34` + `build-tools` 34 或更高）。
 
 > 已知问题：build-tools **34.0.0** 自带的 d8 处理本项目代码时会内部报错（R8 的 NPE），
 > 因此 `build.sh` 会自动优先选用 35.0.0+。
 
+### APK 签名密钥
+
+密钥**不在仓库里**。`build.sh` 按以下顺序查找：
+
+1. 环境变量 `BLEUNLOCK_KEYSTORE_DIR`
+2. `~/.config/ble-unlock/` ← 默认
+3. 项目目录（兼容早期版本）
+
+都找不到时自动新建并收紧权限（目录 700 / 文件 600）。
+**密钥丢失后无法对已安装的 APK 做覆盖升级**，请自行备份。
+
 ---
 
-## 七、目录结构
+## 目录结构
 
 ```
-ble-unlock/
 ├── dist/BLEUnlockRemote.apk        ← 手机安装包
 ├── mac-ble-unlock.sh               ← Mac 一键安装脚本（自包含）
 ├── mac-src/main.swift              ← Mac 服务端源码
@@ -300,18 +299,24 @@ ble-unlock/
 ├── build.sh                        ← 构建 APK
 ├── verify-protocol.sh              ← 跨语言协议一致性验证
 ├── verify-multikey.sh              ← 令牌解析 / 多密钥存储 / 迁移验证
-├── tools/
-│   ├── VerifyProtocol.java         ← 协议验证工具
-│   ├── VerifyMultiKey.java         ← 多密钥验证工具
-│   ├── testdoubles/                ← android.jar Stub 的真实替身（仅测试用）
-│   ├── ble-test-client.swift       ← 模拟手机端的测试客户端
-│   └── make_icons.py               ← 生成启动图标
-└── toolchain/                      ← 便携 JDK 与 Android SDK（可删）
-
-~/.config/ble-unlock/               ← APK 签名密钥（项目之外，注意备份）
-├── keystore.jks
-└── .keystore-pass
+└── tools/
+    ├── VerifyProtocol.java         ← 协议验证工具
+    ├── VerifyMultiKey.java         ← 多密钥验证工具
+    ├── testdoubles/                ← android.jar Stub 的真实替身（仅测试用）
+    ├── ble-test-client.swift       ← 模拟手机端的测试客户端
+    └── make_icons.py               ← 生成启动图标
 ```
 
-> 项目目录里**没有**任何密钥文件。`keystore.jks` 与 `.keystore-pass` 都在
-> `~/.config/ble-unlock/`，`.gitignore` 里也同时保留了对应规则以防万一。
+---
+
+## 致谢
+
+解锁机制的思路来自 Takeshi Sone 的 [BLEUnlock](https://github.com/ts1/BLEUnlock)（MIT）。
+本项目为**独立实现**，未复制其源代码；蓝牙 GATT 通信协议、配对认证与防重放设计
+均为本项目自有。详见 [LICENSE](LICENSE)。
+
+---
+
+## 许可
+
+[MIT](LICENSE)

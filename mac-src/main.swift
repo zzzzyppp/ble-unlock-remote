@@ -709,6 +709,13 @@ if args.contains("--add-accessibility") {
     exit(0)
 }
 
+// 供安装脚本查询权限状态。必须由 App bundle 内这个可执行文件自己报告，
+// 因为「辅助功能」权限是按二进制（TCC 主体）授予的：另编一个探测小程序去查，
+// 得到的是那个程序自己的权限，会永远是「未授权」——这正是之前的误报来源。
+if args.contains("--ax-status") {
+    exit(accessibilityGranted() ? 0 : 1)
+}
+
 if args.contains("--check") {
     guard let config = loadConfig() else {
         print("配置: 缺失（\(kConfigPath)）")

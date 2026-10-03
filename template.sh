@@ -83,19 +83,25 @@ check_swiftc() {
 }
 
 have_accessibility() {
-    # 用一个极小的探测程序判断是否已获得辅助功能权限
-    local probe="$APP_SUPPORT/.axprobe"
-    local probe_src="$APP_SUPPORT/.axprobe.swift"
-    if [ ! -x "$probe" ] || [ ! -f "$probe_src" ] || [ "$probe_src" -nt "$probe" ]; then
-        cat > "$probe_src" <<'PROBE'
-import ApplicationServices
-let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-let trusted = AXIsProcessTrustedWithOptions([key: false] as CFDictionary)
-exit(trusted ? 0 : 1)
-PROBE
-        swiftc -O "$probe_src" -o "$probe" >/dev/null 2>&1 || return 1
+    # 关键：必须由 App bundle 里的可执行文件自己报告。
+    # 「辅助功能」权限是按二进制（TCC 主体）授予的，另编一个探测小程序去查，
+    # 拿到的是那个程序自己的权限，会永远是「未授权」。
+    if [ ! -x "$APP_BIN" ]; then
+        return 1   # 还没编译
     fi
-    "$probe" >/dev/null 2>&1
+    # 旧版二进制不认识 --ax-status，直接调用会被当成「启动服务」而挂住。
+    # 用能力标记文件判断（不能用 grep 扫二进制：Swift 会合并参数字符串）。
+    local caps="$APP_BUNDLE/Contents/Resources/capabilities"
+    if [ ! -f "$caps" ] || ! grep -q 'ax-status' "$caps" 2>/dev/null; then
+        return 2   # 二进制过旧，需要重新运行 install
+    fi
+    "$APP_BIN" --ax-status >/dev/null 2>&1
+    return $?
+}
+
+# 程序是否已就绪（用于区分「没装」和「权限没给」）
+app_ready() {
+    [ -x "$APP_BIN" ]
 }
 
 # ---------------------------------------------------------------- 编译与安装
@@ -164,6 +170,15 @@ compile_binary() {
 </dict>
 </plist>
 PLIST
+
+    # 能力标记文件。脚本靠它判断二进制是否支持某些查询参数，
+    # 而不是去猜二进制内容——Swift 编译器会合并参数字符串，
+    # 直接用 grep/strings 查找是不可靠的。
+    cat > "$APP_BUNDLE/Contents/Resources/capabilities" <<CAPS
+name=BLEUnlockCmd
+version=1.1.0
+features=ax-status
+CAPS
 
     # 临时签名：辅助功能权限是按签名绑定的，未签名的话每次重编译都要重新授权
     codesign --force --sign - --identifier "jp.sone.bleunlockcmd" \
@@ -409,15 +424,22 @@ cmd_status() {
     status_service
     echo
     echo "${C_BOLD}权限与配置${C_RESET}"
-    if have_accessibility; then
-        ok "辅助功能权限：已授权"
+    if ! app_ready; then
+        fail "程序：未编译（请先运行 $0 install）"
     else
-        fail "辅助功能权限：未授权（解锁不会生效）"
-    fi
-    if [ -x "$APP_BIN" ]; then
         ok "程序：$APP_BIN"
-    else
-        fail "程序：未编译"
+        have_accessibility
+        local ax=$?
+        if [ $ax -eq 0 ]; then
+            ok "辅助功能权限：已授权"
+        elif [ $ax -eq 2 ]; then
+            warn "辅助功能权限：无法判定（程序版本过旧）"
+            echo "    请重新运行 $0 install 更新程序后再检查"
+        else
+            fail "辅助功能权限：未授权（解锁不会生效）"
+            echo "    修复：$0 accessibility"
+            echo "    注意：授权后需重启服务才生效：$0 restart"
+        fi
     fi
     if [ -f "$CONFIG_FILE" ]; then
         ok "配置文件：$CONFIG_FILE"
