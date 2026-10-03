@@ -311,9 +311,11 @@ export ANDROID_SDK_ROOT="$PWD/toolchain/android-sdk"
 
 ## 致谢
 
-解锁机制的思路来自 Takeshi Sone 的 [BLEUnlock](https://github.com/ts1/BLEUnlock)（MIT）。
-本项目为**独立实现**，未复制其源代码；蓝牙 GATT 通信协议、配对认证与防重放设计
-均为本项目自有。详见 [LICENSE](LICENSE)。
+解锁机制（读取钥匙串密码 + `CGEvent` 合成键盘输入 + `login.framework` 锁屏）
+参考自 Takeshi Sone 的 [BLEUnlock](https://github.com/ts1/BLEUnlock)（MIT 许可）。
+
+本项目为**独立实现**，未复制其源代码；蓝牙 GATT 通信协议、配对认证（HMAC-SHA256）
+与防重放设计均为本项目自有。
 
 ---
 
