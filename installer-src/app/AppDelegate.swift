@@ -1,235 +1,292 @@
-// BLE Unlock 安装器 — 界面与主流程
+// BLE Unlock 设置向导 — 主流程
 //
-// 注意：入口不在这里。@main 属性在只有 Command Line Tools 的 Swift 工具链下
-// 不会正确启动 AppKit（applicationDidFinishLaunching 根本不被调用，表现为
-// 进程在跑但没有窗口）。因此入口改为 installer-src/main.swift 中的显式
-// NSApplicationMain，本文件只放类定义。
+// 设计：App 由用户拖拽安装到「应用程序」后再运行，此时它位于一个稳定的路径，
+// 于是可以在应用内完成全部配置（服务端、密钥、钥匙串、开机自启、权限引导）。
+//
+// 入口在 main.swift（显式 NSApplication），本文件只放类定义。
 
 import Cocoa
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    var installer = Installer(log: { _ in })
+    private let setup = SetupWindow()
+    private let installer = Installer(log: { _ in })
+    private var alreadyInstalled = false
+    private var pendingToken = ""
+    private var accessibilityPollTimer: Timer?
+    private var didFinishAccessibility = false
+    private var stepIndex = 0
+    private let totalSteps = 4.0
+
+    // MARK: - 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        diag("=== 安装器启动 pid=\(getpid()) ===")
+        diag("=== 设置向导启动 pid=\(getpid()) ===")
         diag("bundle=\(Bundle.main.bundlePath)")
+        diag("support=\(Const.supportDir.path)")
+
+        if isTranslocated() {
+            diag("警告：App 正运行于随机只读路径（Gatekeeper 路径随机化）")
+        }
 
         NSApp.setActivationPolicy(.regular)
         buildMainMenu()
-        NSApp.activate(ignoringOtherApps: true)
-        diag("激活策略 regular，主菜单已建立")
 
-        DispatchQueue.main.async { self.runFlow() }
-    }
+        alreadyInstalled = FileManager.default.fileExists(atPath: Const.serviceApp.path)
+        diag("是否已安装：\(alreadyInstalled)")
 
-    /// 没有主菜单时，NSAlert.runModal() 在部分 macOS 版本上不会显示窗口。
-    /// 必须建立一个最小可用的 App 菜单。
-    private func buildMainMenu() {
-        let mainMenu = NSMenu()
+        setup.installer = installer
+        setup.onPrimary = { [weak self] stage in self?.handlePrimary(stage) }
+        setup.onSecondary = { [weak self] in self?.handleSecondary() }
+        setup.present()
 
-        let appMenuItem = NSMenuItem()
-        mainMenu.addItem(appMenuItem)
-        let appMenu = NSMenu()
-        appMenuItem.submenu = appMenu
-
-        let appName = "BLE Unlock 安装器"
-        appMenu.addItem(withTitle: "关于 \(appName)",
-                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
-                        keyEquivalent: "")
-        appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "隐藏 \(appName)",
-                        action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "退出 \(appName)",
-                        action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-
-        NSApp.mainMenu = mainMenu
+        if alreadyInstalled && installer.hasAccessibility() {
+            setup.appendLog("检测到服务端与权限均已就绪")
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
     }
 
-    // MARK: - 主流程
+    // MARK: - 主菜单（没有它对话框可能不显示）
 
-    private func runFlow() {
-        let fm = FileManager.default
-        let isUpgrade = fm.fileExists(atPath: Const.serviceApp.path)
+    private func buildMainMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenuItem.submenu = appMenu
+        let name = "BLE Unlock"
+        appMenu.addItem(withTitle: "关于 \(name)",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "退出 \(name)",
+                        action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        NSApp.mainMenu = mainMenu
+    }
 
-        // ---------- 欢迎 ----------
-        let welcomeText = """
-        这个安装器会在你的 Mac 上完成以下配置：
+    /// Gatekeeper 会把未公证的 App 放到随机只读路径运行。
+    /// 该路径每次启动都不同，会导致辅助功能权限无法稳定绑定。
+    private func isTranslocated() -> Bool {
+        Bundle.main.bundlePath.contains("/AppTranslocation/")
+    }
 
-        1. 安装蓝牙解锁服务端到「应用程序支持」目录
-        2. \(isUpgrade ? "保留原有的配对密钥" : "生成你的专属配对密钥")
-        3. 把你的登录密码存入 macOS 钥匙串
-        4. 设置开机自动启动
-        5. 引导你授权「辅助功能」权限
+    // MARK: - 按钮分发
 
-        全程不需要终端，也不需要安装 Xcode。
-        """
-        let welcomeChoice = present(
-            title: isUpgrade ? "更新 BLE Unlock 服务端" : "安装 BLE Unlock 服务端",
-            message: welcomeText,
-            buttons: [isUpgrade ? "开始更新" : "开始安装", "退出"])
-        guard welcomeChoice == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue else {
+    private func handlePrimary(_ stage: SetupWindow.Stage) {
+        switch stage {
+        case .intro:
+            setup.showPassword(alreadyInstalled: alreadyInstalled)
+        case .needPassword:
+            let password = setup.passwordValue
+            if password.isEmpty {
+                setup.appendLog("✗ 密码不能为空，请重新输入")
+                setup.shakePassword()
+                return
+            }
+            runInstall(password: password)
+        case .finished:
             NSApp.terminate(nil)
-            return
+        case .working:
+            break
         }
+    }
 
-        // ---------- 密码 ----------
-        guard let password = askPassword(isUpgrade: isUpgrade) else {
+    private func handleSecondary() {
+        switch setup.stage {
+        case .intro:
             NSApp.terminate(nil)
-            return
+        case .needPassword:
+            setup.showIntro(alreadyInstalled: alreadyInstalled)
+        case .finished:
+            if didFinishAccessibility {
+                copyToken()
+            } else {
+                openLog()
+            }
+        case .working:
+            break
         }
+    }
 
-        // ---------- 执行安装 ----------
-        var report: [String] = []
+    private func copyToken() {
+        guard !pendingToken.isEmpty else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(pendingToken, forType: .string)
+        setup.appendLog("✓ 配对令牌已复制到剪贴板")
+    }
 
-        installer.log = { msg in
-            NSLog("[BLEUnlock] %@", msg)
-            report.append(msg)
+    private func openLog() {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/BLEUnlockSetup.log")
+        NSWorkspace.shared.open(path)
+    }
+
+    // MARK: - 安装流程
+
+    private func runInstall(password: String) {
+        setup.showProgress()
+        setup.setStep(0, total: totalSteps)
+        stepIndex = 0
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            var failure: String?
+
+            func step(_ title: String, _ work: () -> String?) {
+                DispatchQueue.main.sync {
+                    self.stepIndex += 1
+                    self.setup.appendLog("→ \(title)")
+                    self.setup.setStep(Double(self.stepIndex) - 0.5, total: self.totalSteps)
+                }
+                if let err = work() {
+                    failure = err
+                    DispatchQueue.main.sync { self.setup.appendLog("✗ \(title) 失败：\(err)") }
+                } else {
+                    DispatchQueue.main.sync {
+                        self.setup.appendLog("✓ \(title)")
+                        self.setup.setStep(Double(self.stepIndex), total: self.totalSteps)
+                    }
+                }
+            }
+
+            // 1. 安装服务端
+            step("安装服务端程序") {
+                if case .failed(let e) = self.installer.installService() { return e }
+                return nil
+            }
+            if failure == nil {
+                // 2. 配对密钥
+                step(self.alreadyInstalled ? "保留配对密钥" : "生成配对密钥") {
+                    if case .failed(let e) = self.installer.ensureKey() { return e }
+                    return nil
+                }
+            }
+            if failure == nil {
+                // 3. 开机自启
+                step("设置开机自启") {
+                    if case .failed(let e) = self.installer.installLaunchAgent() { return e }
+                    return nil
+                }
+            }
+            if failure == nil {
+                // 4. 登录密码
+                step("保存登录密码到钥匙串") {
+                    if case .failed(let e) = self.installer.storePassword(password) { return e }
+                    return nil
+                }
+            }
+
+            let token = self.installer.pairingToken() ?? ""
+            _ = self.installer.verifyPassword()
+            self.installer.startService()
+
+            DispatchQueue.main.async {
+                if let failure = failure {
+                    let logPath = "~/Library/Logs/BLEUnlockSetup.log"
+                    self.setup.showFinished(success: false, message: """
+                    安装过程中出错，服务端可能未正确配置：
+
+                    \(failure)
+
+                    详细信息见日志：\(logPath)
+                    """)
+                    diag("安装失败：\(failure)")
+                    return
+                }
+                self.pendingToken = token
+                self.finishSuccessfully(token: token)
+            }
         }
+    }
 
-        installer.stopService()
-
-        if case .failed(let e) = installer.installService() {
-            alert("安装失败", e, style: .critical)
-            NSApp.terminate(nil)
-            return
-        }
-        if case .failed(let e) = installer.ensureKey() {
-            alert("安装失败", e, style: .critical)
-            NSApp.terminate(nil)
-            return
-        }
-        if case .failed(let e) = installer.installLaunchAgent() {
-            alert("安装失败", e, style: .critical)
-            NSApp.terminate(nil)
-            return
-        }
-        if case .failed(let e) = installer.storePassword(password) {
-            alert("安装失败", e, style: .critical)
-            NSApp.terminate(nil)
-            return
-        }
-
-        installer.startService()
-        // 给服务一点启动时间，便于随后查询权限状态
-        Thread.sleep(forTimeInterval: 1.5)
-
-        // ---------- 结果与令牌 ----------
-        let token = installer.pairingToken() ?? "（读取失败，请重新运行安装器）"
+    private func finishSuccessfully(token: String) {
         let axOK = installer.hasAccessibility()
+        diag("安装完成，辅助功能权限：\(axOK)")
 
-        let doneText = """
-        接下来只需两步：
-
-        1. 在手机 App 里点「＋ 添加 Mac」，粘贴下面的配对令牌
-        2. 点「解锁」即可
+        var message = """
+        服务端已就绪。
 
         ───── 配对令牌 ─────
         \(token)
         ───────────────────
 
-        \(axOK
-            ? "「辅助功能」权限已授权，一切就绪。"
-            : "还差最后一步：「辅助功能」权限尚未授权，未授权时无法自动解锁。")
+        在手机 App 里点「＋ 添加 Mac」，粘贴上面的令牌，然后点「解锁」。
         """
-        let choice = present(title: isUpgrade ? "更新完成" : "安装完成",
-                             message: doneText,
-                             buttons: [axOK ? "完成" : "去授权", "复制令牌"])
 
-        if choice == NSApplication.ModalResponse.alertSecondButtonReturn.rawValue {
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(token, forType: .string)
-            alert("已复制", "配对令牌已复制到剪贴板，可粘贴到手机 App。")
-        }
-
-        if !installer.hasAccessibility() {
-            guideAccessibility()
-        }
-
-        NSApp.terminate(nil)
-    }
-
-    // MARK: - 密码输入
-
-    private func askPassword(isUpgrade: Bool) -> String? {
-        while true {
-            let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-            field.placeholderString = "登录密码"
-
-            let response = present(
-                title: "输入你的登录密码",
-                message: """
-                蓝牙解锁需要用你的登录密码来自动解锁屏幕。
-                密码会存入 macOS 钥匙串，不会写入任何配置文件，也不会通过网络传输。
-
-                请务必填写正确，否则锁屏时无法解锁。
-                """,
-                buttons: ["确定", "取消"],
-                accessory: field)
-
-            guard response == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue else {
-                return nil
+        if axOK {
+            didFinishAccessibility = true
+            message += "\n\n「辅助功能」权限已授权，一切就绪。"
+            setup.showFinished(success: true, message: message)
+        } else {
+            didFinishAccessibility = false
+            message += "\n\n还差最后一步：「辅助功能」权限尚未授权。点下方按钮前往授权。"
+            setup.showFinished(success: true, message: message)
+            setup.setSecondaryTitle("复制配对令牌")
+            setup.setPrimaryTitle("打开系统设置授权")
+            setup.onPrimary = { [weak self] _ in self?.startAccessibilityFlow() }
+            // 给用户 3 秒读完令牌，再自动引导
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.startAccessibilityFlow()
             }
-            let value = field.stringValue
-            if value.isEmpty {
-                alert("密码不能为空", "请重新输入。", style: .warning)
-                continue
-            }
-            return value
         }
     }
 
-    // MARK: - 辅助功能引导
+    // MARK: - 辅助功能权限引导
 
-    private func guideAccessibility() {
-        let choice = present(
-            title: "最后一步：授权「辅助功能」",
-            message: """
-            macOS 要求「辅助功能」权限才允许程序模拟键盘输入。
-            没有这个权限，解锁会静默失败。
-
-            点击「打开系统设置」后：
-            1. 在列表里找到 BLEUnlockCmd
-            2. 打开它的开关
-            3. 若列表里没有，点左下角 ＋ 添加：
-               \(Const.serviceBin.path)
-
-            授权后无需重启，立即生效。
-            """,
-            buttons: ["打开系统设置", "稍后再说"])
-
-        if choice == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue {
-            installer.openAccessibilitySettings()
+    private func startAccessibilityFlow() {
+        if installer.hasAccessibility() {
+            confirmAccessibilityOK()
+            return
         }
+        setup.appendLog("")
+        setup.appendLog("→ 打开「系统设置 → 隐私与安全性 → 辅助功能」")
+        setup.appendLog("  在列表中找到 BLEUnlockCmd 并打开开关")
+        setup.appendLog("  若列表中没有，点左下角 ＋ 添加：")
+        setup.appendLog("  \(Const.serviceBin.path)")
+        installer.openAccessibilitySettings()
 
-        // 等用户操作完再复查一次
-        let check = present(title: "授权好了吗？",
-                            message: "点「检查」来确认权限是否已生效。",
-                            buttons: ["检查", "跳过"])
-        if check == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue {
-            if installer.hasAccessibility() {
-                alert("权限已生效", """
-                一切就绪，现在可以用手机解锁这台 Mac 了。
-
-                如果解锁没反应，检查一下：
-                • Mac 上是否已锁定屏幕（未锁定时解锁会返回 NOT_LOCKED）
-                • 手机与 Mac 的蓝牙是否都开启
-                """)
-            } else {
-                alert("权限还未生效", """
-                系统设置里可能还没打开开关，或者需要退出系统设置重新打开。
-
-                你可以随时重新运行这个安装器再检查一次，
-                或在终端执行：
-                \(Const.serviceBin.path) --check
-                """, style: .warning)
+        // 轮询等待用户完成授权，最多 3 分钟
+        accessibilityPollTimer?.invalidate()
+        var waited = 0.0
+        accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) {
+            [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            waited += 2.0
+            if self.installer.hasAccessibility() {
+                timer.invalidate()
+                self.confirmAccessibilityOK()
+            } else if waited >= 180 {
+                timer.invalidate()
+                self.setup.appendLog("✗ 等待超时，权限仍未生效")
+                self.setup.appendLog("  可稍后重新打开本 App，它会再次引导")
+            } else if Int(waited) % 20 == 0 {
+                self.setup.appendLog("  等待授权中…（已等待 \(Int(waited)) 秒）")
             }
         }
+    }
+
+    private func confirmAccessibilityOK() {
+        didFinishAccessibility = true
+        setup.appendLog("✓ 「辅助功能」权限已生效")
+        setup.setPrimaryTitle("完成")
+        setup.setSecondaryTitle("复制配对令牌")
+        setup.onPrimary = { [weak self] _ in NSApp.terminate(nil) }
+        setup.showFinished(success: true, message: """
+        全部就绪！现在可以用手机解锁这台 Mac 了。
+
+        ───── 配对令牌 ─────
+        \(pendingToken)
+        ───────────────────
+
+        在手机 App 里点「＋ 添加 Mac」粘贴令牌，然后点「解锁」。
+
+        如果解锁没反应：
+        • 确认 Mac 屏幕已锁定（未锁定时会返回 NOT_LOCKED）
+        • 确认手机与 Mac 的蓝牙都已开启
+        """)
     }
 }

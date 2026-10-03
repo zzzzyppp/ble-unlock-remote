@@ -30,7 +30,7 @@
 
 | 文件 | 适用 | 说明 |
 |---|---|---|
-| `BLEUnlock-Installer-*.dmg` | **推荐** | 图形安装器。双击 → 按提示操作即可，**不需要终端，也不需要 Xcode**。仅支持 Apple Silicon |
+| `BLEUnlock-*.dmg` | **推荐** | 拖到「应用程序」即安装，打开后在界面内完成配置。**不需要终端，也不需要 Xcode**。仅 Apple Silicon |
 | `mac-ble-unlock.sh` | Intel Mac / 偏好命令行 | 自包含脚本。需要 Xcode Command Line Tools，会现场编译 |
 | `BLEUnlockRemote.apk` | 手机端 | Android 安装包（已签名，可直接侧载） |
 | `SHA256SUMS.txt` | — | 校验值 |
@@ -47,20 +47,22 @@ shasum -a 256 -c SHA256SUMS.txt
 
 ### 1. Mac 端
 
-#### 方式 A：图形安装器（推荐）
+#### 方式 A：拖拽安装（推荐）
 
-1. 下载 `BLEUnlock-Installer-*.dmg`，双击打开
-2. **右键点击「BLEUnlock Installer」→ 选择「打开」→ 再点「打开」**
+1. 下载 DMG，双击打开
+2. 把左边的 **BLE Unlock** 拖到右边的 **Applications**
+3. 打开「应用程序」里的 **BLE Unlock**
+4. **右键点击 App → 选择「打开」→ 再点「打开」**
 
-   > 只需做一次。本项目没有 Apple 开发者签名证书，无法通过公证，
-   > 所以首次打开需要这样绕过 Gatekeeper。与程序安全性无关。
+   > 只需做一次。本项目没有 Apple 开发者签名证书，无法通过公证。
 
-3. 按提示输入登录密码（存入钥匙串，不写入任何文件）
-4. 安装器自动完成：安装服务端 → 生成配对密钥 → 设置开机自启
-5. 安装器会引导你授权「辅助功能」权限，并显示**配对令牌**（可一键复制）
+5. 按界面提示输入一次登录密码，其余全自动完成
+6. 按引导授权「辅助功能」权限，并记下**配对令牌**
 
-安装完成后即可删除 DMG。再次运行安装器即为升级，**配对密钥会保留**，
-手机端无需任何改动。
+> 请从「应用程序」运行，不要直接在 DMG 里运行——DMG 是只读的，
+> 且系统会给它分配随机路径，会导致权限无法保存。
+
+再次打开本 App 即为重新配置/更新，**配对密钥会保留**，手机端无需改动。
 
 #### 方式 B：命令行脚本
 
@@ -193,11 +195,11 @@ chmod +x mac-ble-unlock.sh
 | | |
 |---|---|
 | macOS | 11 及以上（服务端） |
-| CPU | **Apple Silicon**（图形安装器）；Intel Mac 请用命令行脚本 |
+| CPU | **Apple Silicon**（拖拽安装包）；Intel Mac 请用命令行脚本 |
 | Android | 8.0 及以上（minSdk 26，targetSdk 34） |
 | Swift | 仅方式 B 需要 Xcode Command Line Tools |
 
-> **为什么安装器只有 Apple Silicon 版？**
+> **为什么安装包只有 Apple Silicon 版？**
 > 本项目在只有 Command Line Tools（无完整 Xcode）的环境下构建，
 > 而其 Swift 兼容库只包含 arm64（`libswiftCompatibility56.a` 为 arm64/arm64e），
 > 无法交叉编译 x86_64。Intel Mac 请用命令行脚本方式，它会在本机现场编译。
@@ -321,12 +323,15 @@ export ANDROID_SDK_ROOT="$PWD/toolchain/android-sdk"
 │   │   └── MainActivity.java       ← 界面
 │   └── res/
 ├── build.sh                        ← 构建 APK
-├── build-installer.sh              ← 构建图形安装器（.dmg）
-├── installer-src/                  ← 安装器源码
-│   ├── Installer.swift             ← 安装逻辑
-│   ├── AppMain.swift               ← 图形界面
-│   ├── BuildInfo.swift             ← 版本信息（构建时生成）
-│   └── main.swift                  ← 安装逻辑的自动化测试驱动
+├── build-installer.sh              ← 构建拖拽安装包（.dmg）
+├── installer-src/                  ← 安装 App 源码
+│   ├── app/                        ← App 本体
+│   │   ├── main.swift              ← 入口（显式 NSApplication）
+│   │   ├── AppDelegate.swift       ← 流程编排
+│   │   ├── SetupWindow.swift       ← 设置向导界面
+│   │   ├── Installer.swift         ← 安装逻辑
+│   │   └── BuildInfo.swift         ← 版本信息（构建时生成）
+│   └── test/                       ← 安装逻辑的端到端测试
 ├── verify-protocol.sh              ← 跨语言协议一致性验证
 ├── verify-multikey.sh              ← 令牌解析 / 多密钥存储 / 迁移验证
 └── tools/

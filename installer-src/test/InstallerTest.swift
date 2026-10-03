@@ -1,19 +1,17 @@
-// 安装器逻辑的自动化测试
+// 安装流程的端到端测试（控制台，不启动界面）
 //
-// 用真实的服务端二进制在临时目录里跑一遍 installService / ensureKey /
-// installLaunchAgent，验证产出结构与权限，不触碰钥匙串与真实安装。
+// 用真实的 Installer 代码与真实的服务端二进制，在临时目录里跑完整流程
+// （安装服务端 → 生成密钥 → 开机自启 → 写入钥匙串 → 回读验证）。
 //
-// 顶层语句必须位于名为 main.swift 的文件中，而该文件名已被 App 入口占用，
-// 因此这里把测试包成函数，由 installer-src/test-main.swift 调用。
+// 通过环境变量重定向，避免触碰用户的真实安装与真实密码条目：
+//   BLEUNLOCK_SUPPORT_DIR / BLEUNLOCK_LAUNCH_AGENT / BLEUNLOCK_KEYCHAIN_SERVICE
+//
+// 顶层语句必须位于名为 main.swift 的文件，该名字已被 App 入口占用，
+// 因此这里包成函数，由 test/main.swift 调用。
 
 import Cocoa
 
-// 测试用：仅在编译期用于定位源文件同名类型
 func runInstallerTests() {
-    let testSupportDir = ProcessInfo.processInfo.environment["BLEUNLOCK_SUPPORT_DIR"] ?? ""
-    let testLaunchAgent = ProcessInfo.processInfo.environment["BLEUNLOCK_LAUNCH_AGENT"] ?? ""
-    let serviceBinaryPath = ProcessInfo.processInfo.environment["BLEUNLOCK_TEST_BINARY"] ?? ""
-
     var failures = 0
 
     func check(_ label: String, _ ok: Bool, _ detail: String = "") {
@@ -25,143 +23,172 @@ func runInstallerTests() {
         }
     }
 
-    func fileExists(_ url: URL) -> Bool {
+    func exists(_ url: URL) -> Bool {
         FileManager.default.fileExists(atPath: url.path)
     }
 
-    func posixMode(_ url: URL) -> Int {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-        return (attrs?[.posixPermissions] as? NSNumber)?.intValue ?? -1
+    func mode(_ url: URL) -> Int {
+        let a = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (a?[.posixPermissions] as? NSNumber)?.intValue ?? -1
     }
 
-    print("=== 安装器逻辑测试 ===")
-    print("  支持目录: \(Const.supportDir.path)")
-    print("  LaunchAgent: \(Const.launchAgent.path)")
+    print("=== 安装流程端到端测试 ===")
+    print("  支持目录:     \(Const.supportDir.path)")
+    print("  LaunchAgent:  \(Const.launchAgent.path)")
+    print("  钥匙串服务名: \(Const.keychainService)")
     print()
 
     let installer = Installer(log: { print("     [log] \($0)") })
+    let testPassword = "test-pw-\(Int(Date().timeIntervalSince1970))"
 
     // ---- 1. 安装服务端 ----
-    print("== 1. installService ==")
+    print("== 1. 安装服务端 ==")
     switch installer.installService() {
-    case .failed(let e):
-        check("installService 成功", false, e)
-    case .ok:
-        check("installService 成功", true)
+    case .failed(let e): check("installService", false, e)
+    case .ok: check("installService", true)
     }
+    check("服务端 bundle 存在", exists(Const.serviceApp))
+    check("可执行文件存在", exists(Const.serviceBin))
+    check("可执行权限 755", mode(Const.serviceBin) == 0o755,
+          "实际 \(String(mode(Const.serviceBin), radix: 8))")
 
-    check("服务端 bundle 存在", fileExists(Const.serviceApp))
-    check("可执行文件存在", fileExists(Const.serviceBin))
-    check("可执行文件权限为 755", posixMode(Const.serviceBin) == 0o755,
-          "实际 \(String(posixMode(Const.serviceBin), radix: 8))")
-    check("Info.plist 存在", fileExists(Const.serviceApp.appendingPathComponent("Contents/Info.plist")))
-    check("capabilities 标记存在",
-          fileExists(Const.serviceApp.appendingPathComponent("Contents/Resources/capabilities")))
+    let infoPlist = (try? String(contentsOf: Const.serviceApp
+        .appendingPathComponent("Contents/Info.plist"), encoding: .utf8)) ?? ""
+    check("Info.plist 含 CFBundleIdentifier", infoPlist.contains(Const.bundleID))
+    check("Info.plist 含蓝牙权限说明", infoPlist.contains("NSBluetoothAlwaysUsageDescription"))
 
-    let caps = (try? String(contentsOf: Const.serviceApp
-        .appendingPathComponent("Contents/Resources/capabilities"), encoding: .utf8)) ?? ""
+    let capsURL = Const.serviceApp.appendingPathComponent("Contents/Resources/capabilities")
+    let caps = (try? String(contentsOf: capsURL, encoding: .utf8)) ?? ""
     check("capabilities 含 ax-status", caps.contains("ax-status"), "内容: \(caps)")
 
-    let plist = (try? String(contentsOf: Const.serviceApp
-        .appendingPathComponent("Contents/Info.plist"), encoding: .utf8)) ?? ""
-    check("Info.plist 含蓝牙权限说明", plist.contains("NSBluetoothAlwaysUsageDescription"))
-    check("Info.plist 含正确 BundleID", plist.contains(Const.bundleID))
+    let ver = runFull(Const.serviceBin.path, ["--version"])
+    check("装好的服务端可运行", ver.code == 0, ver.summary)
+    check("版本输出正常", ver.out.contains("BLEUnlockCmd"), ver.out)
 
-    // 服务端装好后应能运行
-    let ver = run(Const.serviceBin.path, ["--version"])
-    check("装好的服务端可运行", ver.code == 0, "退出码 \(ver.code)")
-    check("版本输出正常", ver.out.contains("BLEUnlockCmd"), "输出: \(ver.out)")
+    let ax = runFull(Const.serviceBin.path, ["--ax-status"])
+    check("--ax-status 可查询（退出码 0/1）", ax.code == 0 || ax.code == 1,
+          "退出码 \(ax.code) \(ax.err)")
 
     // ---- 2. 配对密钥 ----
     print()
-    print("== 2. ensureKey ==")
+    print("== 2. 配对密钥 ==")
     switch installer.ensureKey() {
-    case .failed(let e): check("ensureKey 成功", false, e)
-    case .ok: check("ensureKey 成功", true)
+    case .failed(let e): check("ensureKey", false, e)
+    case .ok: check("ensureKey", true)
     }
-    check("config.json 存在", fileExists(Const.configFile))
-    check("config.json 权限为 600", posixMode(Const.configFile) == 0o600,
-          "实际 \(String(posixMode(Const.configFile), radix: 8))")
+    check("config.json 存在", exists(Const.configFile))
+    check("config.json 权限 600", mode(Const.configFile) == 0o600,
+          "实际 \(String(mode(Const.configFile), radix: 8))")
 
     var firstKey = ""
     if let data = FileManager.default.contents(atPath: Const.configFile.path),
        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         firstKey = obj["hmacKey"] as? String ?? ""
-        check("含 hmacKey", !firstKey.isEmpty)
         check("hmacKey 为 32 字节 base64",
               Data(base64Encoded: firstKey)?.count == 32,
-              "长度 \(Data(base64Encoded: firstKey)?.count ?? -1)")
-        check("含 deviceName", (obj["deviceName"] as? String)?.hasPrefix("BLEUnlock-") ?? false)
-        check("含 keychainAccount", !(obj["keychainAccount"] as? String ?? "").isEmpty)
+              "解码长度 \(Data(base64Encoded: firstKey)?.count ?? -1)")
+        check("deviceName 以 BLEUnlock- 开头",
+              (obj["deviceName"] as? String)?.hasPrefix("BLEUnlock-") ?? false,
+              "实际 \(obj["deviceName"] ?? "nil")")
+        check("keychainAccount 非空",
+              !((obj["keychainAccount"] as? String) ?? "").isEmpty)
     } else {
         check("config.json 可解析", false)
     }
+    check("配对令牌可读取", installer.pairingToken() == firstKey && !firstKey.isEmpty)
 
-    // 幂等性：重复执行不应更换密钥
-    switch installer.ensureKey() {
-    case .failed(let e): check("重复 ensureKey 成功", false, e)
-    case .ok: check("重复 ensureKey 成功", true)
-    }
-    var secondKey = ""
-    if let data = FileManager.default.contents(atPath: Const.configFile.path),
-       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-        secondKey = obj["hmacKey"] as? String ?? ""
-    }
-    check("重复安装不更换密钥", firstKey == secondKey && !firstKey.isEmpty)
-
-    check("配对令牌可读取", installer.pairingToken() == firstKey)
-
-    // ---- 3. LaunchAgent ----
+    // ---- 3. 开机自启 ----
     print()
-    print("== 3. installLaunchAgent ==")
+    print("== 3. 开机自启 ==")
     switch installer.installLaunchAgent() {
-    case .failed(let e): check("installLaunchAgent 成功", false, e)
-    case .ok: check("installLaunchAgent 成功", true)
+    case .failed(let e): check("installLaunchAgent", false, e)
+    case .ok: check("installLaunchAgent", true)
     }
-    check("plist 文件存在", fileExists(Const.launchAgent))
-
+    check("plist 存在", exists(Const.launchAgent))
     if let data = FileManager.default.contents(atPath: Const.launchAgent.path),
        let parsed = try? PropertyListSerialization.propertyList(
            from: data, options: [], format: nil) as? [String: Any] {
         check("plist 可解析", true)
-        check("Label 正确", parsed["Label"] as? String == Const.serviceLabel,
-              "实际 \(parsed["Label"] ?? "nil")")
-        check("RunAtLoad 为 true", (parsed["RunAtLoad"] as? Bool) == true)
-        check("KeepAlive 为 true", (parsed["KeepAlive"] as? Bool) == true)
-        let args = parsed["ProgramArguments"] as? [String]
+        check("Label 正确", parsed["Label"] as? String == Const.serviceLabel)
+        check("RunAtLoad", (parsed["RunAtLoad"] as? Bool) == true)
+        check("KeepAlive", (parsed["KeepAlive"] as? Bool) == true)
         check("ProgramArguments 指向服务端",
-              args?.first == Const.serviceBin.path,
-              "实际 \(args?.first ?? "nil")")
+              (parsed["ProgramArguments"] as? [String])?.first == Const.serviceBin.path)
     } else {
         check("plist 可解析", false)
     }
 
-    // ---- 4. 升级场景 ----
+    // ---- 4. 钥匙串（真实写入，但用临时服务名）----
     print()
-    print("== 4. 升级场景（密钥应保留）==")
+    print("== 4. 登录密码写入钥匙串 ==")
+    switch installer.storePassword(testPassword) {
+    case .failed(let e):
+        check("storePassword", false, e.replacingOccurrences(of: "\n", with: " "))
+    case .ok:
+        check("storePassword 成功", true)
+    }
+    let readBack = installer.verifyPassword()
+    check("回读成功", readBack != nil)
+    check("回读内容与写入一致", readBack == testPassword,
+          "写入 \(testPassword.count) 字符，回读 \(readBack?.count ?? -1) 字符")
+
+    let second = testPassword + "-v2"
+    switch installer.storePassword(second) {
+    case .failed(let e):
+        check("覆盖写入", false, e.replacingOccurrences(of: "\n", with: " "))
+    case .ok:
+        check("覆盖写入成功", true)
+    }
+    check("覆盖后回读为新值", installer.verifyPassword() == second)
+
+    // ---- 5. 升级幂等 ----
+    print()
+    print("== 5. 升级幂等 ==")
     switch installer.installService() {
-    case .failed(let e): check("升级时 installService 成功", false, e)
-    case .ok: check("升级时 installService 成功", true)
+    case .failed(let e): check("升级 installService", false, e)
+    case .ok: check("升级 installService", true)
     }
     switch installer.ensureKey() {
-    case .failed(let e): check("升级时 ensureKey 成功", false, e)
-    case .ok: check("升级时 ensureKey 成功", true)
+    case .failed(let e): check("升级 ensureKey", false, e)
+    case .ok: check("升级 ensureKey", true)
     }
     var thirdKey = ""
     if let data = FileManager.default.contents(atPath: Const.configFile.path),
        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         thirdKey = obj["hmacKey"] as? String ?? ""
     }
-    check("升级后密钥保持不变", thirdKey == firstKey && !firstKey.isEmpty)
-    check("升级后服务端仍可运行", run(Const.serviceBin.path, ["--version"]).code == 0)
-    check("升级后 capabilities 仍存在",
-          fileExists(Const.serviceApp.appendingPathComponent("Contents/Resources/capabilities")))
+    check("升级后配对密钥保持不变", thirdKey == firstKey && !firstKey.isEmpty)
+    check("升级后服务端仍可运行", runFull(Const.serviceBin.path, ["--version"]).code == 0)
+    check("升级后 capabilities 仍在", exists(capsURL))
 
-    // ---- 5. 签名 ----
+    // ---- 6. 签名 ----
     print()
-    print("== 5. 签名 ==")
-    let cs = run("/usr/bin/codesign", ["-v", Const.serviceApp.path])
-    check("服务端签名有效", cs.code == 0, "退出码 \(cs.code)")
+    print("== 6. 签名 ==")
+    check("服务端签名有效",
+          runFull("/usr/bin/codesign", ["-v", Const.serviceApp.path]).code == 0)
+
+    // ---- 7. 旧版二进制的防护 ----
+    //
+    // 装上旧版服务端（没有 capabilities 标记）时，绝不能用 --ax-status 去探它：
+    // 旧二进制不认这个参数，会把它当成启动参数而**常驻运行**，留下孤儿进程。
+    print()
+    print("== 7. 旧版二进制防护 ==")
+    let capsBackup = (try? String(contentsOf: capsURL, encoding: .utf8)) ?? ""
+    try? FileManager.default.removeItem(at: capsURL)
+
+    check("移除 capabilities 后 hasAccessibility 返回 false",
+          installer.hasAccessibility() == false)
+
+    // 关键：不能留下 --ax-status 孤儿进程
+    let orphans = runFull("/usr/bin/pgrep", ["-fl", "--ax-status"])
+    let orphanText = orphans.out.trimmingCharacters(in: .whitespacesAndNewlines)
+    check("未产生 --ax-status 孤儿进程", orphanText.isEmpty,
+          "发现: \(orphanText)")
+
+    // 恢复标记，确认防护不会误伤正常情况
+    try? capsBackup.write(to: capsURL, atomically: true, encoding: .utf8)
+    check("恢复 capabilities 后可正常查询",
+          runFull(Const.serviceBin.path, ["--ax-status"]).code <= 1)
 
     print()
     if failures == 0 {
@@ -171,5 +198,4 @@ func runInstallerTests() {
         print("结果: \(failures) 项失败 ✗")
         exit(1)
     }
-
 }

@@ -35,32 +35,63 @@ enum Const {
         return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/jp.sone.bleunlockcmd.plist")
     }
-    static let keychainService = "ble-unlock-cmd"
+    static var keychainService: String {
+        if let o = ProcessInfo.processInfo.environment["BLEUNLOCK_KEYCHAIN_SERVICE"], !o.isEmpty {
+            return o
+        }
+        return "ble-unlock-cmd"
+    }
     static let serviceLabel = "jp.sone.bleunlockcmd"
     static let bundleID = "jp.sone.bleunlockcmd"
 }
 
 // MARK: - 小工具
 
-func run(_ path: String, _ args: [String], input: String? = nil) -> (code: Int32, out: String) {
+/// 带 stderr 的执行结果。失败时 stderr 往往就是原因，不能丢。
+struct RunResult {
+    var code: Int32
+    var out: String
+    var err: String
+    /// 便于诊断的一行摘要
+    var summary: String {
+        let e = err.trimmingCharacters(in: .whitespacesAndNewlines)
+        if code == 0 { return "ok" }
+        return "退出码 \(code)" + (e.isEmpty ? "" : "：\(e)")
+    }
+}
+
+func runFull(_ path: String, _ args: [String], input: String? = nil) -> RunResult {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
     let outPipe = Pipe()
+    let errPipe = Pipe()
     p.standardOutput = outPipe
-    p.standardError = Pipe()
+    p.standardError = errPipe
     if input != nil {
         let inPipe = Pipe()
         p.standardInput = inPipe
-        do { try p.run() } catch { return (-1, "") }
+        do { try p.run() } catch {
+            return RunResult(code: -1, out: "", err: "\(error.localizedDescription)")
+        }
         inPipe.fileHandleForWriting.write(input!.data(using: .utf8)!)
         try? inPipe.fileHandleForWriting.close()
     } else {
-        do { try p.run() } catch { return (-1, "") }
+        do { try p.run() } catch {
+            return RunResult(code: -1, out: "", err: "\(error.localizedDescription)")
+        }
     }
-    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    return RunResult(code: p.terminationStatus,
+                     out: String(data: outData, encoding: .utf8) ?? "",
+                     err: String(data: errData, encoding: .utf8) ?? "")
+}
+
+func run(_ path: String, _ args: [String], input: String? = nil) -> (code: Int32, out: String) {
+    let r = runFull(path, args, input: input)
+    return (r.code, r.out)
 }
 
 /// 安装 App 内遗留的旧版本文件（重启服务用）
@@ -114,11 +145,11 @@ func alert(_ title: String, _ message: String, style: NSAlert.Style = .informati
     _ = present(title: title, message: message, buttons: ["好"], style: style)
 }
 
-/// 诊断日志。写入 ~/Library/Logs/BLEUnlockInstaller.log。
+/// 诊断日志。写入 ~/Library/Logs/BLEUnlockSetup.log。
 /// 安装器在图形环境下出错时没有任何终端输出，必须留痕才能排查。
 func diag(_ message: String) {
     let path = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/BLEUnlockInstaller.log")
+        .appendingPathComponent("Library/Logs/BLEUnlockSetup.log")
     let line = "[\(Date())] \(message)\n"
     if let h = try? FileHandle(forWritingTo: path) {
         h.seekToEndOfFile()
@@ -302,20 +333,43 @@ struct Installer {
 
     func storePassword(_ password: String) -> StepResult {
         let account = NSUserName()
-        // 先删旧条目再写入（与命令行版脚本行为一致）
-        _ = run("/usr/bin/security",
-                ["delete-generic-password", "-a", account, "-s", Const.keychainService])
-        let r = run("/usr/bin/security",
-                    ["add-generic-password", "-U",
-                     "-a", account,
-                     "-s", Const.keychainService,
-                     "-l", "BLEUnlockCmd",
-                     "-w", password])
+
+        // 直接带 -U 写入（存在则原地更新）。
+        // 刻意不「先删后加」：一旦写入失败，用户原有的密码条目就丢了。
+        let r = runFull("/usr/bin/security",
+                        ["add-generic-password", "-U",
+                         "-a", account,
+                         "-s", Const.keychainService,
+                         "-l", "BLEUnlockCmd",
+                         "-w", password])
         if r.code != 0 {
-            return .failed("写入钥匙串失败，请确认密码是否正确后重试。")
+            log("写入钥匙串失败：\(r.summary)")
+            return .failed("""
+            写入钥匙串失败（\(r.summary)）。
+
+            最常见的原因是钥匙串被锁定。请打开「钥匙串访问」解锁后重试。
+            """)
         }
-        log("登录密码已存入钥匙串")
-        return .ok("密码已保存")
+
+        // 立刻回读确认。密码写错是「解锁静默失败」的头号原因。
+        guard let readBack = verifyPassword() else {
+            return .failed("""
+            密码写入后无法回读，钥匙串可能处于锁定状态。
+            请解锁「钥匙串访问」后重试。
+            """)
+        }
+        if readBack != password {
+            log("警告：回读内容与输入不一致（长度 \(readBack.count) vs \(password.count)）")
+            return .failed("""
+            钥匙串回读的内容与输入不一致：
+              输入长度 \(password.count)，回读长度 \(readBack.count)
+
+            请重新运行本 App 再试一次。
+            """)
+        }
+
+        log("登录密码已存入钥匙串（长度 \(readBack.count)，已回读确认）")
+        return .ok("密码已保存并验证")
     }
 
     func hasPassword() -> Bool {
@@ -323,11 +377,52 @@ struct Installer {
             ["find-generic-password", "-a", NSUserName(), "-s", Const.keychainService]).code == 0
     }
 
+    /// 回读钥匙串里的密码，确认写入成功。
+    /// 密码写错是「解锁静默失败」最常见的原因，装完立刻验证一次能省掉大量排查。
+    @discardableResult
+    func verifyPassword() -> String? {
+        let r = run("/usr/bin/security",
+                    ["find-generic-password", "-a", NSUserName(),
+                     "-s", Const.keychainService, "-w"])
+        guard r.code == 0 else {
+            log("回读密码失败（退出码 \(r.code)）")
+            return nil
+        }
+        var pw = r.out
+        while pw.hasSuffix("\n") || pw.hasSuffix("\r") { pw.removeLast() }
+        log("已回读钥匙串密码，长度 \(pw.count)")
+        return pw.isEmpty ? nil : pw
+    }
+
     // ---- 5. 辅助功能权限 ----
 
+    /// 服务端二进制是否支持 --ax-status 查询。
+    ///
+    /// 必须用能力标记文件判断，不能直接调用后看结果：旧版二进制不认识这个参数，
+    /// 会把 `--ax-status` 当成普通启动参数，于是**真的把服务跑起来并常驻**，
+    /// 留下一个孤儿进程。也不能 grep 二进制——Swift 会合并参数字符串。
+    private func serviceSupportsAxStatus() -> Bool {
+        let caps = Const.serviceApp.appendingPathComponent("Contents/Resources/capabilities")
+        guard let text = try? String(contentsOf: caps, encoding: .utf8) else { return false }
+        return text.contains("ax-status")
+    }
+
+    /// 查询辅助功能权限状态。
+    ///
+    /// 注意：本函数必须由 App bundle 内的二进制自己回答——「辅助功能」权限是
+    /// 按二进制（TCC 主体）授予的，另编一个程序去查只会得到它自己的权限。
     func hasAccessibility() -> Bool {
         guard FileManager.default.isExecutableFile(atPath: Const.serviceBin.path) else { return false }
-        return run(Const.serviceBin.path, ["--ax-status"]).code == 0
+        guard serviceSupportsAxStatus() else {
+            log("服务端版本过旧，无法查询权限状态（需重新安装）")
+            return false
+        }
+        let r = runFull(Const.serviceBin.path, ["--ax-status"])
+        guard r.code == 0 || r.code == 1 else {
+            log("权限查询异常：\(r.summary)")
+            return false
+        }
+        return r.code == 0
     }
 
     func openAccessibilitySettings() {
