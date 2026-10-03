@@ -20,7 +20,7 @@ import javax.crypto.spec.SecretKeySpec;
  *   4     8     时间戳，大端 UInt64（秒）
  *   12    16    nonce，随机字节
  *   28    1     密码序号（0 基）。仅 CMD_UNLOCK_FROM 使用
- *   29    1     保留（0x00）
+ *   29    1     跳过锁屏校验标志（0=否，1=是）
  *   30    32    HMAC-SHA256(前 30 字节)
  *
  * 注意：HMAC 覆盖前 30 字节（0..29），因此消息缓冲区固定为 30 字节。
@@ -64,12 +64,26 @@ public final class Protocol {
      */
     public static byte[] buildPacket(byte command, byte[] key, int passwordIndex)
             throws Exception {
+        return buildPacket(command, key, passwordIndex, false);
+    }
+
+    /**
+     * 生成指令包。
+     *
+     * @param passwordIndex 优先使用的密码序号（0 基）；负数表示不指定
+     * @param skipLockCheck 是否让 Mac 跳过"锁屏校验"直接注入。
+     *                      手机端「填充密码」按钮属于人工明确指令，
+     *                      用户就是要现在把密码送进去，不需要再判断是否锁屏。
+     */
+    public static byte[] buildPacket(byte command, byte[] key, int passwordIndex,
+                                     boolean skipLockCheck) throws Exception {
         if (key == null || key.length != 32) {
             throw new IllegalArgumentException("配对密钥必须是 32 字节");
         }
-        // 指定密码时改用带序号的指令码；未指定则用原来的指令码，
-        // 这样旧版 Mac 服务端仍能正常工作。
-        if (command == CMD_UNLOCK && passwordIndex >= 0 && passwordIndex <= 255) {
+        // 指定了密码序号、或要求跳过锁屏校验时，都要用带这两个字段的指令码。
+        // 两者都不需要时保持原指令码，这样旧版 Mac 服务端仍能正常工作。
+        boolean needExtraFields = (passwordIndex >= 0 && passwordIndex <= 255) || skipLockCheck;
+        if (command == CMD_UNLOCK && needExtraFields) {
             command = CMD_UNLOCK_FROM;
         }
 
@@ -88,10 +102,10 @@ public final class Protocol {
         RANDOM.nextBytes(nonce);
         System.arraycopy(nonce, 0, message, 12, 16);
 
-        // 偏移 28：密码序号；29 保留
-        if (command == CMD_UNLOCK_FROM && passwordIndex >= 0) {
-            message[28] = (byte) passwordIndex;
-            message[29] = 0;
+        // 偏移 28：密码序号；偏移 29：跳过锁屏校验标志
+        if (command == CMD_UNLOCK_FROM) {
+            if (passwordIndex >= 0) message[28] = (byte) passwordIndex;
+            message[29] = skipLockCheck ? (byte) 1 : (byte) 0;
         }
 
         byte[] tag = hmacSha256(key, message);

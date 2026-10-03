@@ -71,7 +71,7 @@ public class VerifyProtocol {
         System.out.println("== 1b. 指定密码解锁（CMD_UNLOCK_FROM）==");
         // 手机选"用第几个密码"时，指令码变成 0x04，序号放在字节 28（HMAC 保护范围内）。
         for (int idx : new int[]{0, 1, 2, 7, 255}) {
-            byte[] msg = buildMessage(0x04, idx);
+            byte[] msg = buildMessage((byte) 0x04, idx);
             boolean cmdOk = msg[3] == 0x04;
             boolean idxOk = (msg[28] & 0xFF) == idx;
             boolean reservedOk = msg[29] == 0;
@@ -80,9 +80,26 @@ public class VerifyProtocol {
                   "cmd=" + msg[3] + " b28=" + (msg[28] & 0xFF) + " b29=" + msg[29]);
         }
         // 普通解锁不应带序号语义
-        byte[] plain = buildMessage(0x01, -1);
+        byte[] plain = buildMessage((byte) 0x01, -1);
         check("普通解锁字节 28 保持为 0", plain[28] == 0 && plain[29] == 0,
               "b28=" + plain[28] + " b29=" + plain[29]);
+
+        System.out.println();
+        System.out.println("== 1c. 跳过锁屏校验标志（字节 29）==");
+        for (int idx : new int[]{0, 2, 255}) {
+            for (boolean force : new boolean[]{false, true}) {
+                byte[] msg = buildMessage((byte) 0x04, idx, force);
+                boolean ok = msg[3] == 0x04
+                        && (msg[28] & 0xFF) == idx
+                        && (msg[29] != 0) == force;
+                check("序号 " + idx + (force ? " +跳过校验" : " 常规") + " 编码正确", ok,
+                      "b28=" + (msg[28] & 0xFF) + " b29=" + msg[29]);
+            }
+        }
+        // 只要求跳过校验、不指定序号时，序号为 0（即第一个密码）
+        byte[] forceOnly = buildMessage((byte) 0x04, 0, true);
+        check("仅跳过校验（序号取 0）", forceOnly[28] == 0 && forceOnly[29] == 1,
+              "b28=" + forceOnly[28] + " b29=" + forceOnly[29]);
 
         System.out.println();
         System.out.println("== 2. Java 端 HMAC-SHA256 ==");
@@ -153,6 +170,13 @@ public class VerifyProtocol {
      * @param passwordIndex 密码序号（0 基）；负数表示不指定，字节 28 保持 0
      */
     static byte[] buildMessage(byte command, int passwordIndex) {
+        return buildMessage(command, passwordIndex, false);
+    }
+
+    /**
+     * @param skipLockCheck 字节 29：是否跳过锁屏校验
+     */
+    static byte[] buildMessage(byte command, int passwordIndex, boolean skipLockCheck) {
         byte[] m = new byte[30];
         m[0] = 0x42;
         m[1] = 0x55;
@@ -160,6 +184,9 @@ public class VerifyProtocol {
         m[3] = command;
         if (passwordIndex >= 0) {
             m[28] = (byte) passwordIndex;
+        }
+        if (skipLockCheck) {
+            m[29] = 1;
         }
         ByteBuffer ts = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN);
         ts.putLong(TS);

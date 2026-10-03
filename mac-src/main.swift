@@ -33,6 +33,12 @@ let kPacketLen  = 62                        // 2 magic + 1 ver + 1 cmd + 8 ts + 
 let kHmacOffset = 30                        // HMAC 覆盖前 30 字节
 /// 字节 28：密码序号（0 基）。仅 kCmdUnlockFrom 使用；位于 HMAC 覆盖范围内，长度不变。
 let kIndexOffset = 28
+/// 字节 29：是否跳过"锁屏校验"。
+///
+/// 手机端「填充密码」是人工明确下达的指令，不需要再判断屏幕是否处于锁定状态——
+/// 用户就是要现在把这些字符送进去。置 1 时 Mac 会直接注入，不因未锁屏而中止。
+/// 同样位于 HMAC 覆盖范围内。
+let kForceOffset = 29
 
 let kTimestampSkew: Int64 = 120             // 允许的时钟偏差（秒）
 let kNonceCacheLimit = 512
@@ -178,6 +184,12 @@ func storePasswords(_ passwords: [String], account: String) -> Bool {
         return false
     }
     return writeKeychainPassword(json, account: account)
+}
+
+/// 是否要求跳过锁屏校验（字节 29 非 0）
+func extractForceFlag(_ bytes: [UInt8]) -> Bool {
+    guard bytes.count > kForceOffset, bytes[3] == kCmdUnlockFrom else { return false }
+    return bytes[kForceOffset] != 0
 }
 
 /// 从报文中取出密码序号。
@@ -391,10 +403,16 @@ func accessibilityGranted(prompt: Bool = false) -> Bool {
 var unlockInFlight = false
 
 /// 自动解锁：唤醒屏幕 -> 确认处于锁屏 -> 注入密码
-/// - Parameter preferredIndex: 优先尝试第几个密码（0 基）。为 nil 时按保存顺序。
-///   手机端可以指定"用哪个密码解锁"；若指定的序号越界或该密码不对，
-///   会自动回退到按原顺序继续尝试其余密码。
+/// - Parameters:
+///   - preferredIndex: 优先尝试第几个密码（0 基）。为 nil 时按保存顺序。
+///     手机端可以指定"用哪个密码解锁"；若指定的序号越界或该密码不对，
+///     会自动回退到按原顺序继续尝试其余密码。
+///   - force: 跳过"锁屏校验"。
+///     手机端「填充密码」是人工明确下达的指令——用户就是要现在把字符送进去，
+///     不需要（也不应该）再判断屏幕是否处于锁定状态。为 true 时直接注入，
+///     不等待锁屏、不轮询唤醒。
 func performUnlock(preferredIndex: UInt8? = nil,
+                   force: Bool = false,
                    reply: @escaping (String) -> Void) {
     guard !unlockInFlight else {
         reply("BUSY")
@@ -433,13 +451,34 @@ func performUnlock(preferredIndex: UInt8? = nil,
     }
 
     if dryRun {
-        log("[dry-run] 校验通过，共 \(passwords.count) 个密码，本应逐个尝试")
+        log("[dry-run] 校验通过，共 \(passwords.count) 个密码，本应逐个尝试"
+            + (force ? "（强制填充，跳过锁屏校验）" : ""))
         reply("OK")
         return
     }
 
     unlockInFlight = true
     writeDaemonStatus()
+
+    if force {
+        // 强制填充：不判断是否锁屏，直接把选中的密码注入并回车。
+        // 这条路径只做一次，不逐个回退——人工指定用哪个就用哪个。
+        //
+        // 注意：force 可能不带序号（手机只要求"跳过校验"），
+        // 此时 passwords[0] 就是保存顺序里的第一个，即默认密码。
+        let chosen = passwords[0]
+        log("收到强制填充指令（跳过锁屏校验，共 \(passwords.count) 个密码）")
+        // 屏幕若在息屏状态，输入框收不到按键，因此仍先点亮屏幕
+        wakeDisplay()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            log("注入 \(chosen.count) 个字符并回车")
+            fakeKeyStrokes(chosen)
+            unlockInFlight = false
+            reply("OK")
+        }
+        return
+    }
+
     log("收到解锁指令，开始执行（\(passwords.count) 个密码待尝试）")
 
     wakeDisplay()
@@ -568,8 +607,8 @@ let nonceCache = NonceCache()
 // MARK: - 数据包校验
 
 enum VerifyResult {
-    /// command 指令；index 为字节 28 的密码序号（仅指定密码时有效）
-    case ok(command: UInt8, index: UInt8?)
+    /// command 指令；index 为字节 28 的密码序号；force 为字节 29 的跳过锁屏校验标志
+    case ok(command: UInt8, index: UInt8?, force: Bool)
     case failed(String)
 }
 
@@ -597,7 +636,9 @@ func verifyPacket(_ data: Data, key: SymmetricKey) -> VerifyResult {
     for i in 0..<expected.count { diff |= expected[i] ^ received[i] }
     guard diff == 0 else { return .failed("ERR_HMAC") }
 
-    return .ok(command: bytes[3], index: extractPasswordIndex(bytes))
+    return .ok(command: bytes[3],
+               index: extractPasswordIndex(bytes),
+               force: extractForceFlag(bytes))
 }
 
 // MARK: - BLE 外设
@@ -736,12 +777,12 @@ final class PeripheralServer: NSObject, CBPeripheralManagerDelegate {
                 log("校验失败: \(reason)")
                 setStatus(reason)
 
-            case .ok(let command, let index):
+            case .ok(let command, let index, let force):
                 switch command {
                 case kCmdUnlockFrom:
-                    // 手机指定了要用第几个密码
+                    // 手机指定了要用第几个密码；force 时跳过锁屏校验
                     setStatus("UNLOCKING")
-                    performUnlock(preferredIndex: index) { status in
+                    performUnlock(preferredIndex: index, force: force) { status in
                         self.setStatus(status)
                         log("解锁结果: \(status)")
                     }
@@ -853,14 +894,15 @@ if args.contains("--selftest-protocol") {
     print("== 报文校验 ==")
 
     switch verifyPacket(makePacket(command: kCmdUnlock), key: testKey) {
-    case .ok(let c, let i):
+    case .ok(let c, let i, let f):
         expect("合法解锁包通过校验", c == kCmdUnlock, "命令=\(c)")
         expect("普通解锁不带密码序号", i == nil, "实际 \(String(describing: i))")
+        expect("普通解锁不跳过锁屏校验", f == false)
     case .failed(let r): expect("合法解锁包通过校验", false, r)
     }
 
     switch verifyPacket(makePacket(command: kCmdPing), key: testKey) {
-    case .ok(let c, _): expect("PING 包通过校验", c == kCmdPing, "命令=\(c)")
+    case .ok(let c, _, _): expect("PING 包通过校验", c == kCmdPing, "命令=\(c)")
     case .failed(let r): expect("PING 包通过校验", false, r)
     }
 
@@ -968,6 +1010,22 @@ if args.contains("--selftest-protocol") {
     _ = writeKeychainPassword("legacy-plain", account: testAccount)
     let legacy = fetchPasswords(account: testAccount)
     expect("旧格式单密码可识别", legacy == ["legacy-plain"], "实际 \(legacy)")
+
+    // 报文里的"跳过锁屏校验"标志
+    func packetWithForce(_ flag: UInt8, command: UInt8 = kCmdUnlockFrom) -> [UInt8] {
+        var b = [UInt8](repeating: 0, count: kPacketLen)
+        b[0] = 0x42; b[1] = 0x55; b[2] = 0x01; b[3] = command
+        b[kIndexOffset] = 1
+        b[kForceOffset] = flag
+        return b
+    }
+    expect("标志 1 → 解析为强制", extractForceFlag(packetWithForce(1)))
+    expect("标志 0 → 不强制", extractForceFlag(packetWithForce(0)) == false)
+    expect("标志 2 → 视为强制（非 0 即真）", extractForceFlag(packetWithForce(2)))
+    expect("普通解锁不解析强制标志",
+           extractForceFlag(packetWithForce(1, command: kCmdUnlock)) == false)
+    expect("锁定指令不解析强制标志",
+           extractForceFlag(packetWithForce(1, command: kCmdLock)) == false)
 
     // 报文里的密码序号解析
     func packetWithIndex(_ idx: UInt8, command: UInt8 = kCmdUnlockFrom) -> [UInt8] {

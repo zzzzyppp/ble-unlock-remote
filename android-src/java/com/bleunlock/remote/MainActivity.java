@@ -198,13 +198,24 @@ public class MainActivity extends Activity {
         // ---- 填充密码：选择用 Mac 上的第几个密码解锁 ----
         fillPasswordButton = new Button(this);
         fillPasswordButton.setText("填充密码");
+        fillPasswordButton.setAllCaps(false);
+        // 文案含换行（提示长按），给按钮留出两行高度
+        fillPasswordButton.setMinLines(2);
+        fillPasswordButton.setLineSpacing(0f, 0.9f);
         fillPasswordButton.setTextColor(Color.WHITE);
         fillPasswordButton.setBackgroundColor(COL_GREY);
         LinearLayout.LayoutParams fillLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         fillLp.topMargin = dp(10);
         fillPasswordButton.setLayoutParams(fillLp);
-        fillPasswordButton.setOnClickListener(v -> showPasswordPicker());
+        // 点击 = 立刻用选中的密码填充（跳过 Mac 上的锁屏校验）
+        fillPasswordButton.setOnClickListener(v -> fillSelectedPassword());
+        // 长按 = 弹出选择界面，换用哪个密码
+        fillPasswordButton.setOnLongClickListener(v -> {
+            showPasswordPicker();
+            return true;
+        });
+        fillPasswordButton.setLongClickable(true);
         root.addView(fillPasswordButton);
 
         // ---- 次要按钮 ----
@@ -286,6 +297,32 @@ public class MainActivity extends Activity {
 
     /** 列出所有已保存的 Mac，点击即切换 */
     /**
+     * 用当前选中的密码直接填充。
+     *
+     * 这是人工明确下达的指令：跳过 Mac 上的"锁屏校验"直接注入，
+     * 不再判断屏幕是否处于锁定状态。
+     */
+    private void fillSelectedPassword() {
+        final MacEntryStore.Entry active = store.selected();
+        if (active == null) {
+            Toast.makeText(this, "请先添加 Mac", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (service == null) {
+            Toast.makeText(this, "服务尚未就绪，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String err = service.sendCommand(Protocol.CMD_UNLOCK, true);
+        if (err != null) {
+            Toast.makeText(this, err, Toast.LENGTH_LONG).show();
+        } else {
+            Toast.makeText(this,
+                    "已填充「" + active.labelFor(active.preferredPassword) + "」",
+                    Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /**
      * 选择用 Mac 上的第几个密码解锁。
      *
      * 手机不保存密码本身——密码只在 Mac 的钥匙串里。这里选择的是"位次"，
@@ -310,7 +347,7 @@ public class MainActivity extends Activity {
         }
 
         new AlertDialog.Builder(this)
-                .setTitle("用哪个密码解锁")
+                .setTitle("选择要填充的密码")
                 .setItems(labels, (dialog, which) -> {
                     store.setPasswordPreference(active.id, which, active.passwordLabels);
                     renderState();
@@ -626,7 +663,8 @@ public class MainActivity extends Activity {
         macNameView.setTextColor(COL_TEXT);
 
         // 显示当前用哪个密码位（密码本身不在手机上，这里只是位次与名字）
-        fillPasswordButton.setText("填充密码：" + active.labelFor(active.preferredPassword));
+        fillPasswordButton.setText("填充密码：" + active.labelFor(active.preferredPassword)
+                + "\n（长按可更换）");
 
         String state = BleService.getState();
         statusView.setText(state);

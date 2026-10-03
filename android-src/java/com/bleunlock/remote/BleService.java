@@ -478,6 +478,17 @@ public class BleService extends Service {
 
     /** 供界面直接调用。返回 null 表示成功，否则返回错误说明。 */
     public String sendCommand(byte command) {
+        return sendCommand(command, false);
+    }
+
+    /**
+     * 发送指令。
+     *
+     * @param skipLockCheck 仅对解锁有意义：让 Mac 跳过"锁屏校验"直接注入。
+     *                      对应手机端「填充密码」按钮——人工明确要求现在填充，
+     *                      不必再判断屏幕是否锁定。
+     */
+    public String sendCommand(byte command, boolean skipLockCheck) {
         if (activeEntry == null) {
             publish(STATE_ERROR, "尚未配置任何 Mac，请先添加");
             return "尚未配置任何 Mac";
@@ -500,7 +511,7 @@ public class BleService extends Service {
             if (command == Protocol.CMD_UNLOCK && activeEntry != null) {
                 pwIndex = Math.max(0, activeEntry.preferredPassword);
             }
-            byte[] packet = Protocol.buildPacket(command, key, pwIndex);
+            byte[] packet = Protocol.buildPacket(command, key, pwIndex, skipLockCheck);
             c.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
             c.setValue(packet);
             boolean ok = g.writeCharacteristic(c);
@@ -508,7 +519,7 @@ public class BleService extends Service {
                 publish(STATE_ERROR, "写入请求被系统拒绝");
                 return "写入请求被系统拒绝";
             }
-            publish(STATE_SENT, "指令已发出");
+            publish(STATE_SENT, skipLockCheck ? "填充指令已发出" : "指令已发出");
             return null;
         } catch (Exception e) {
             Log.e(TAG, "发送失败", e);
