@@ -9,6 +9,24 @@
 
 ---
 
+## 下载
+
+**直接从 [Releases](https://github.com/zzzzyppp/ble-unlock-remote/releases/latest) 下载**：
+
+| 文件 | 用途 |
+|---|---|
+| `BLEUnlockRemote.apk` | 手机端安装包（已签名，可直接侧载） |
+| `mac-ble-unlock.sh` | Mac 端一键安装脚本（自包含，无需其他文件） |
+| `SHA256SUMS.txt` | 校验值，可选 |
+
+安装步骤见 release 说明，或继续往下读。
+
+> ⚠️ **请勿把 `mac-ble-unlock.sh` 分享给他人。** 手机 App 里内置了从脚本推导密钥的
+> 算法，同时拿到脚本和 APK 的人可以推算出你的配对密钥，进而伪造解锁指令。
+> 请把这两个文件当作密码一样保管。
+
+---
+
 ## 交付物
 
 | 文件 | 说明 |
