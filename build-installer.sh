@@ -20,7 +20,7 @@ cd "$SCRIPT_DIR"
 
 # ---------------------------------------------------------------- 版本
 
-VERSION="${VERSION:-1.2.0}"
+VERSION="${VERSION:-1.2.1}"
 INSTALLER_VERSION="${INSTALLER_VERSION:-1.1.0}"
 MIN_MACOS="11.0"
 ARCH="${ARCH:-arm64}"
@@ -93,8 +93,9 @@ swiftc -O -suppress-warnings \
     -module-cache-path "$SCRIPT_DIR/.cache" \
     -target "${ARCH}-apple-macos${MIN_MACOS}" \
     "$BUILD/BuildInfo.swift" \
-    installer-src/Installer.swift \
-    installer-src/AppMain.swift \
+    installer-src/app/Installer.swift \
+    installer-src/app/AppDelegate.swift \
+    installer-src/app/main.swift \
     -o "$APP_BIN" \
     || die "安装器编译失败"
 chmod 755 "$APP_BIN"
@@ -115,6 +116,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleShortVersionString</key><string>__VERSION__</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>MIT License</string>
 </dict>

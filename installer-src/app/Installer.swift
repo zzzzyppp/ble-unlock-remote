@@ -74,22 +74,65 @@ func killServiceProcess() {
     p.waitUntilExit()
 }
 
+/// 把 App 带到前台。
+///
+/// 从 Finder／挂载的 DMG 启动时，App 常常不在前台，此时 NSAlert.runModal()
+/// 的窗口可能根本不显示（表现为「进程在跑但没有窗口」）。
+/// macOS 14 起 activate(ignoringOtherApps:) 已废弃，需要配合
+/// NSRunningApplication.activate 与 activateAllWindows 才可靠。
+func bringToFront() {
+    NSApp.setActivationPolicy(.regular)
+    NSApp.activate(ignoringOtherApps: true)
+    NSRunningApplication.current.activate(options: [.activateAllWindows])
+}
+
+/// 统一对话框入口：负责置前 + 显示 + 记录日志。
+///
+/// NSAlert 自己会弹面板，无需另建窗口；真正容易出问题的是「App 不在前台」，
+/// 此时面板可能根本不显示（表现为「进程在跑但没有窗口」）。
+func present(title: String,
+             message: String,
+             buttons: [String],
+             accessory: NSView? = nil,
+             style: NSAlert.Style = .informational) -> Int {
+    diag("显示对话框: \(title)")
+
+    let alert = NSAlert()
+    alert.messageText = title
+    alert.informativeText = message
+    alert.alertStyle = style
+    for b in buttons { alert.addButton(withTitle: b) }
+    if let accessory = accessory { alert.accessoryView = accessory }
+
+    bringToFront()
+    let response = alert.runModal()
+    diag("对话框返回: \(response.rawValue)")
+    return response.rawValue
+}
+
 func alert(_ title: String, _ message: String, style: NSAlert.Style = .informational) {
-    let a = NSAlert()
-    a.messageText = title
-    a.informativeText = message
-    a.alertStyle = style
-    a.addButton(withTitle: "好")
-    a.runModal()
+    _ = present(title: title, message: message, buttons: ["好"], style: style)
+}
+
+/// 诊断日志。写入 ~/Library/Logs/BLEUnlockInstaller.log。
+/// 安装器在图形环境下出错时没有任何终端输出，必须留痕才能排查。
+func diag(_ message: String) {
+    let path = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/BLEUnlockInstaller.log")
+    let line = "[\(Date())] \(message)\n"
+    if let h = try? FileHandle(forWritingTo: path) {
+        h.seekToEndOfFile()
+        h.write(line.data(using: .utf8)!)
+        try? h.close()
+    } else {
+        try? line.write(to: path, atomically: true, encoding: .utf8)
+    }
+    FileHandle.standardError.write(line.data(using: .utf8)!)
 }
 
 func confirm(_ title: String, _ message: String, okTitle: String) -> Bool {
-    let a = NSAlert()
-    a.messageText = title
-    a.informativeText = message
-    a.addButton(withTitle: okTitle)
-    a.addButton(withTitle: "退出")
-    return a.runModal() == .alertFirstButtonReturn
+    present(title: title, message: message, buttons: [okTitle, "退出"])
+        == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
 }
 
 // MARK: - 安装逻辑
