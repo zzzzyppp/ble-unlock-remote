@@ -20,6 +20,8 @@ build/
 out/
 # apksigner 的 v4 签名附属文件，侧载安装用不到
 *.idsig
+# 图形安装器（由 build-installer.sh 从源码重建，不入库）
+BLEUnlock-Installer-*.dmg
 
 # --- 运行期生成的密钥与配置（安装到本机时才会产生）---
 config.json

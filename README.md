@@ -28,11 +28,12 @@
 
 **从 [Releases](https://github.com/zzzzyppp/ble-unlock-remote/releases/latest) 下载**：
 
-| 文件 | 用途 |
-|---|---|
-| `BLEUnlockRemote.apk` | 手机端安装包（已签名，可直接侧载） |
-| `mac-ble-unlock.sh` | Mac 端一键安装脚本（自包含，无需其他文件） |
-| `SHA256SUMS.txt` | 校验值，可选 |
+| 文件 | 适用 | 说明 |
+|---|---|---|
+| `BLEUnlock-Installer-*.dmg` | **推荐** | 图形安装器。双击 → 按提示操作即可，**不需要终端，也不需要 Xcode**。仅支持 Apple Silicon |
+| `mac-ble-unlock.sh` | Intel Mac / 偏好命令行 | 自包含脚本。需要 Xcode Command Line Tools，会现场编译 |
+| `BLEUnlockRemote.apk` | 手机端 | Android 安装包（已签名，可直接侧载） |
+| `SHA256SUMS.txt` | — | 校验值 |
 
 校验下载内容：
 
@@ -46,27 +47,41 @@ shasum -a 256 -c SHA256SUMS.txt
 
 ### 1. Mac 端
 
-需要 Swift 编译器（仅编译用）。若未安装：
+#### 方式 A：图形安装器（推荐）
+
+1. 下载 `BLEUnlock-Installer-*.dmg`，双击打开
+2. **右键点击「BLEUnlock Installer」→ 选择「打开」→ 再点「打开」**
+
+   > 只需做一次。本项目没有 Apple 开发者签名证书，无法通过公证，
+   > 所以首次打开需要这样绕过 Gatekeeper。与程序安全性无关。
+
+3. 按提示输入登录密码（存入钥匙串，不写入任何文件）
+4. 安装器自动完成：安装服务端 → 生成配对密钥 → 设置开机自启
+5. 安装器会引导你授权「辅助功能」权限，并显示**配对令牌**（可一键复制）
+
+安装完成后即可删除 DMG。再次运行安装器即为升级，**配对密钥会保留**，
+手机端无需任何改动。
+
+#### 方式 B：命令行脚本
+
+适合 Intel Mac，或偏好命令行的用户。需要先装编译工具：
 
 ```bash
 xcode-select --install
 ```
 
-安装：
+然后：
 
 ```bash
 chmod +x mac-ble-unlock.sh
 ./mac-ble-unlock.sh install
 ```
 
-脚本会依次：编译服务端 → 生成该机器**专属**的配对密钥 → 提示输入**本机登录密码**
-（存入钥匙串）→ 引导授权「辅助功能」→ 注册开机自启，最后打印**配对令牌**。
-
-装完自检：
+#### 装好后自检
 
 ```bash
-./mac-ble-unlock.sh status     # 服务状态、权限、最近日志
-./mac-ble-unlock.sh token      # 再次显示配对令牌
+./mac-ble-unlock.sh status     # 仅方式 B 有脚本；方式 A 用下面的命令
+~/Library/Application\ Support/BLEUnlockCmd/BLEUnlockCmd.app/Contents/MacOS/BLEUnlockCmd --check
 ```
 
 ### 2. 手机端
@@ -178,8 +193,17 @@ chmod +x mac-ble-unlock.sh
 | | |
 |---|---|
 | macOS | 11 及以上（服务端） |
+| CPU | **Apple Silicon**（图形安装器）；Intel Mac 请用命令行脚本 |
 | Android | 8.0 及以上（minSdk 26，targetSdk 34） |
-| Swift | Xcode Command Line Tools（仅编译用） |
+| Swift | 仅方式 B 需要 Xcode Command Line Tools |
+
+> **为什么安装器只有 Apple Silicon 版？**
+> 本项目在只有 Command Line Tools（无完整 Xcode）的环境下构建，
+> 而其 Swift 兼容库只包含 arm64（`libswiftCompatibility56.a` 为 arm64/arm64e），
+> 无法交叉编译 x86_64。Intel Mac 请用命令行脚本方式，它会在本机现场编译。
+>
+> 如果你有完整 Xcode，可以用 `build-installer.sh` 自行构建：
+> `ARCH=arm64` 或改用通用二进制目标。
 
 ---
 
@@ -297,6 +321,12 @@ export ANDROID_SDK_ROOT="$PWD/toolchain/android-sdk"
 │   │   └── MainActivity.java       ← 界面
 │   └── res/
 ├── build.sh                        ← 构建 APK
+├── build-installer.sh              ← 构建图形安装器（.dmg）
+├── installer-src/                  ← 安装器源码
+│   ├── Installer.swift             ← 安装逻辑
+│   ├── AppMain.swift               ← 图形界面
+│   ├── BuildInfo.swift             ← 版本信息（构建时生成）
+│   └── main.swift                  ← 安装逻辑的自动化测试驱动
 ├── verify-protocol.sh              ← 跨语言协议一致性验证
 ├── verify-multikey.sh              ← 令牌解析 / 多密钥存储 / 迁移验证
 └── tools/
