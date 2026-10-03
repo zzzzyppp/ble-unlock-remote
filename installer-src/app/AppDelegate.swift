@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var didFinishAccessibility = false
     private var stepIndex = 0
     private let totalSteps = 4.0
+    private var passwordEditor: PasswordEditor?
 
     // MARK: - 生命周期
 
@@ -38,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setup.installer = installer
         setup.onPrimary = { [weak self] stage in self?.handlePrimary(stage) }
         setup.onSecondary = { [weak self] in self?.handleSecondary() }
+        setup.onManagePasswords = { [weak self] in self?.openPasswordEditor() }
         setup.present()
 
         if alreadyInstalled, let daemonAX = installer.daemonAccessibility() {
@@ -73,6 +75,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 该路径每次启动都不同，会导致辅助功能权限无法稳定绑定。
     private func isTranslocated() -> Bool {
         Bundle.main.bundlePath.contains("/AppTranslocation/")
+    }
+
+    /// 打开密码管理窗口
+    private func openPasswordEditor() {
+        if !FileManager.default.isExecutableFile(atPath: Const.serviceBin.path) {
+            alert("尚未安装", "请先完成设置，之后即可在这里管理密码。")
+            return
+        }
+        if passwordEditor == nil {
+            passwordEditor = PasswordEditor(installer: installer)
+        }
+        passwordEditor?.present { [weak self] in
+            // 关闭后刷新主窗口的说明，便于用户看到密码数量变化
+            self?.setup.appendLog("密码管理窗口已关闭")
+        }
     }
 
     // MARK: - 按钮分发

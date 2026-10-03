@@ -47,7 +47,13 @@ let kAppSupport: String = {
 }()
 let kConfigPath = kAppSupport + "/config.json"
 let kLogPath    = kAppSupport + "/ble-unlock.log"
-let kKeychainService = "ble-unlock-cmd"
+/// 钥匙串服务名。可用环境变量覆盖，便于自动化测试用独立条目验证。
+let kKeychainService: String = {
+    if let o = ProcessInfo.processInfo.environment["BLEUNLOCK_KEYCHAIN_SERVICE"], !o.isEmpty {
+        return o
+    }
+    return "ble-unlock-cmd"
+}()
 /// 守护进程把自己的 TCC 权限状态写在这里，供设置向导读取。
 ///
 /// 为什么不直接问进程：TCC 的 AX 信任会从父进程继承。设置向导从 Finder/终端
@@ -126,7 +132,56 @@ func ensureSupportDirectory() {
 
 // MARK: - 密码读取（keychain）
 
+/// 把结果按 JSON 输出，便于设置向导解析（避免两端各写一套逻辑）
+func printJSON(_ payload: [String: Any]) {
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+       let text = String(data: data, encoding: .utf8) {
+        print(text)
+    }
+}
+
+// MARK: - 多密码存储
+//
+// 每台设备可以保存多个登录密码（例如刚改过密码、或同时用多个账户）。
+// 解锁时按顺序逐个尝试，直到屏幕解开为止。
+//
+// 存储格式：钥匙串里放一个 JSON 数组。这样单个条目就能装下全部密码，
+// 也天然兼容"只有一个密码"的旧格式——读取时若解析失败就当作单个明文密码。
+
+/// 读取全部密码。顺序即尝试顺序。
+func fetchPasswords(account: String) -> [String] {
+    guard let raw = readKeychainPassword(account: account) else { return [] }
+
+    // 新格式：JSON 数组。
+    // 注意：只要解析成功就以它为准，即使结果是空数组——
+    // 否则「[]」会被当成一个两字符的密码（曾踩过这个坑）。
+    if let data = raw.data(using: .utf8),
+       let arr = try? JSONSerialization.jsonObject(with: data) as? [String] {
+        return arr.filter { !$0.isEmpty }.map(normalizePassword)
+    }
+
+    // 旧格式：单个明文密码
+    return raw.isEmpty ? [] : [normalizePassword(raw)]
+}
+
+/// 写回全部密码。始终写 JSON 数组，便于日后增删。
+@discardableResult
+func storePasswords(_ passwords: [String], account: String) -> Bool {
+    let list = passwords.filter { !$0.isEmpty }.map(normalizePassword)
+    guard let data = try? JSONSerialization.data(withJSONObject: list, options: []),
+          let json = String(data: data, encoding: .utf8) else {
+        log("密码序列化失败")
+        return false
+    }
+    return writeKeychainPassword(json, account: account)
+}
+
+/// 兼容旧接口：返回第一个密码
 func fetchPassword(account: String) -> String? {
+    fetchPasswords(account: account).first
+}
+
+func readKeychainPassword(account: String) -> String? {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
     process.arguments = ["find-generic-password",
@@ -148,7 +203,83 @@ func fetchPassword(account: String) -> String? {
     var pw = String(data: data, encoding: .utf8) ?? ""
     // security -w 会附带一个换行
     while pw.hasSuffix("\n") || pw.hasSuffix("\r") { pw.removeLast() }
-    return pw.isEmpty ? nil : pw
+    guard !pw.isEmpty else { return nil }
+    return decodeHexIfNeeded(pw)
+}
+
+/// `security -w` 对**非 ASCII** 的密码会输出十六进制串而不是原文
+/// （例如「中文密码」会读成 "e4b8ade69687e5af86e7a081"）。
+/// 这里把它还原。
+///
+/// 判定条件刻意保守，避免误伤"本来就是十六进制"的 ASCII 密码：
+/// 只有整串是合法十六进制、长度为偶数，**且解码后含非 ASCII 字符**时才还原。
+/// 纯 ASCII 的密码解码后仍是 ASCII，因此不会被误改。
+func decodeHexIfNeeded(_ value: String) -> String {
+    let hexDigits = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
+    guard value.count >= 2, value.count % 2 == 0,
+          value.unicodeScalars.allSatisfy({ hexDigits.contains($0) }) else {
+        return value
+    }
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(value.count / 2)
+    var idx = value.startIndex
+    while idx < value.endIndex {
+        let next = value.index(idx, offsetBy: 2)
+        guard let byte = UInt8(value[idx..<next], radix: 16) else { return value }
+        bytes.append(byte)
+        idx = next
+    }
+    guard let decoded = String(bytes: bytes, encoding: .utf8) else { return value }
+    // 只有解码结果含非 ASCII 时才认定是 hex 编码；
+    // 否则保留原文，避免把形如 "deadbeef" 的密码改掉。
+    guard decoded.unicodeScalars.contains(where: { $0.value > 127 }) else { return value }
+    log("钥匙串返回的是十六进制编码，已还原为原文（\(value.count) → \(decoded.count) 字符）")
+    return decoded
+}
+
+/// 统一规范化形式。
+///
+/// macOS 钥匙串会把非 ASCII 字符存成 NFD（分解式，é = e + 组合重音），
+/// 而输入往往是 NFC（预组合）。两种形式渲染相同、NFC 归一后相等，
+/// 但码点不同会让字符串比较出现假失败。这里统一成 NFC，让存取确定。
+func normalizePassword(_ s: String) -> String {
+    s.precomposedStringWithCanonicalMapping
+}
+
+/// 用 security 命令写入钥匙串（-U 表示存在则原地更新）
+func writeKeychainPassword(_ value: String, account: String) -> Bool {
+    let r = runProcess("/usr/bin/security",
+                       ["add-generic-password", "-U",
+                        "-a", account,
+                        "-s", kKeychainService,
+                        "-l", "BLEUnlockCmd",
+                        "-w", value])
+    if r.code != 0 {
+        let detail = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+        log("写入钥匙串失败：退出码 \(r.code)" + (detail.isEmpty ? "" : "：\(detail)"))
+        return false
+    }
+    return true
+}
+
+/// 执行外部命令并同时返回 stderr，便于诊断
+func runProcess(_ path: String, _ args: [String]) -> (code: Int32, out: String, err: String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    p.standardOutput = outPipe
+    p.standardError = errPipe
+    do { try p.run() } catch {
+        return (-1, "", error.localizedDescription)
+    }
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus,
+            String(data: outData, encoding: .utf8) ?? "",
+            String(data: errData, encoding: .utf8) ?? "")
 }
 
 // MARK: - 屏幕状态 / 显示器控制
@@ -183,6 +314,16 @@ func sleepDisplay() {
 var dryRun = false
 
 // MARK: - 键盘事件注入（解锁的核心）
+
+/// 发送一个单独的按键（用虚拟键码），例如 Esc 用来清空密码输入框
+func sendKey(_ virtualKey: CGKeyCode) {
+    if dryRun { return }
+    guard let source = CGEventSource(stateID: .hidSystemState) else { return }
+    CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true)?
+        .post(tap: .cghidEventTap)
+    CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false)?
+        .post(tap: .cghidEventTap)
+}
 
 func fakeKeyStrokes(_ string: String) {
     if dryRun {
@@ -238,51 +379,92 @@ func performUnlock(reply: @escaping (String) -> Void) {
         reply("ERR_NO_AX")
         return
     }
-    guard let config = loadConfig(), let password = fetchPassword(account: config.keychainAccount) else {
+    guard let config = loadConfig() else {
+        log("解锁失败：配置缺失")
+        reply("ERR_CONFIG")
+        return
+    }
+
+    let passwords = fetchPasswords(account: config.keychainAccount)
+    guard !passwords.isEmpty else {
         log("解锁失败：钥匙串中读不到密码")
         reply("ERR_NO_PW")
         return
     }
 
     if dryRun {
-        log("[dry-run] 校验通过，本应执行解锁（密码 \(password.count) 字符）")
+        log("[dry-run] 校验通过，共 \(passwords.count) 个密码，本应逐个尝试")
         reply("OK")
         return
     }
 
     unlockInFlight = true
-    // 刷新权限状态：用户可能刚在系统设置里授权，无需重启服务
     writeDaemonStatus()
-    log("收到解锁指令，开始执行")
+    log("收到解锁指令，开始执行（\(passwords.count) 个密码待尝试）")
 
     wakeDisplay()
 
     // 显示器唤醒后需要一点时间才真正点亮，重试几轮
-    var attempt = 0
-    let maxAttempts = 8
+    var wakeAttempt = 0
+    let maxWakeAttempts = 8
+    /// 每个密码注入后，等待多久再判断是否解锁成功
+    let settleDelay = 1.2
 
-    func finish(password: String, attempt: Int) {
-        log("屏幕已锁定，注入密码（第 \(attempt) 次尝试）")
-        fakeKeyStrokes(password)
+    /// 解锁成功收尾
+    func succeeded(after tried: Int) {
         unlockInFlight = false
-        log("已注入密码并回车，解锁指令完成")
+        if tried == 0 {
+            log("已注入密码并回车，解锁指令完成")
+        } else {
+            log("第 \(tried + 1) 个密码生效，解锁指令完成")
+        }
         reply("OK")
     }
 
+    /// 依次尝试每个密码；全部失败则回报
+    func tryPassword(at index: Int) {
+        guard index < passwords.count else {
+            unlockInFlight = false
+            log("已尝试全部 \(passwords.count) 个密码，屏幕仍未解锁")
+            reply("ERR_ALL_PW")
+            return
+        }
+
+        let isLast = (index == passwords.count - 1)
+        log("注入第 \(index + 1)/\(passwords.count) 个密码（\(passwords[index].count) 字符）")
+
+        // 尝试前先清空输入框：上一个密码若错误，字段里可能残留内容。
+        // 用 Esc 清空比逐字符删除可靠。
+        if index > 0 {
+            sendKey(0x35)   // Esc
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+
+        fakeKeyStrokes(passwords[index])
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) {
+            if !isScreenLocked() {
+                succeeded(after: index)
+            } else {
+                if !isLast { log("  该密码无效，继续尝试下一个") }
+                tryPassword(at: index + 1)
+            }
+        }
+    }
+
     func tick() {
-        attempt += 1
+        wakeAttempt += 1
         wakeDisplay()
 
         if isScreenLocked() {
             // 再等 0.4s 让密码输入框获得焦点
-            let current = attempt
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                finish(password: password, attempt: current)
+                tryPassword(at: 0)
             }
             return
         }
 
-        if attempt >= maxAttempts {
+        if wakeAttempt >= maxWakeAttempts {
             unlockInFlight = false
             log("解锁中止：屏幕未处于锁定状态（可能已由用户手动解锁）")
             reply("NOT_LOCKED")
@@ -693,6 +875,59 @@ if args.contains("--selftest-protocol") {
     _ = sem.wait(timeout: .now() + 20)
     expect("缺少钥匙串密码时返回 ERR_NO_PW", unlockResult == "ERR_NO_PW", "实际 \(unlockResult)")
 
+    // 多密码：dry-run 应能识别出全部密码并逐个尝试
+    let testAccount = "__bleunlock_selftest_multi__"
+    storePasswords(["selftest-pw-1", "selftest-pw-2", "selftest-pw-3"], account: testAccount)
+    let readBack = fetchPasswords(account: testAccount)
+    expect("多密码可写入并读回 3 个", readBack.count == 3, "实际 \(readBack.count)")
+    expect("顺序保持", readBack.first == "selftest-pw-1" && readBack.last == "selftest-pw-3",
+           "实际 \(readBack)")
+
+    let multiConfig = Config(hmacKey: Data(keyBytes).base64EncodedString(),
+                             keychainAccount: testAccount,
+                             deviceName: "SELFTEST")
+    try? enc.encode(multiConfig).write(to: URL(fileURLWithPath: kConfigPath))
+
+    var multiResult = ""
+    let sem2 = DispatchSemaphore(value: 0)
+    performUnlock { status in
+        multiResult = status
+        sem2.signal()
+    }
+    _ = sem2.wait(timeout: .now() + 20)
+    expect("多密码 dry-run 返回 OK", multiResult == "OK", "实际 \(multiResult)")
+
+    // 特殊字符必须能原样往返（引号、反斜杠、空格、中文、$、反引号）
+    // 这类字符在 shell 管道里容易被吃掉，所以必须在代码路径上验证。
+    let tricky = ["p@ss w0rd", "with\"quote", "with\\backslash", "中文密码",
+                  "$dollar`tick", "tab\there"]
+    storePasswords(tricky, account: testAccount)
+    let trickyBack = fetchPasswords(account: testAccount)
+    expect("特殊字符数量正确", trickyBack.count == tricky.count,
+           "写入 \(tricky.count) 读回 \(trickyBack.count)")
+    expect("特殊字符内容原样", trickyBack == tricky, "实际 \(trickyBack)")
+
+    // 空密码应被过滤掉，不能产生一条空条目
+    storePasswords(["keep-me", "", "  "], account: testAccount)
+    let filtered = fetchPasswords(account: testAccount)
+    expect("空密码被过滤（仅过滤空串）",
+           filtered.first == "keep-me" && !filtered.contains(""),
+           "实际 \(filtered.count) 个：\(filtered)")
+
+    // 旧格式兼容：钥匙串里直接放明文
+    _ = writeKeychainPassword("legacy-plain", account: testAccount)
+    let legacy = fetchPasswords(account: testAccount)
+    expect("旧格式单密码可识别", legacy == ["legacy-plain"], "实际 \(legacy)")
+
+    // 清空后应为空列表（不能把 JSON 文本 "[]" 当密码）
+    storePasswords([], account: testAccount)
+    let emptied = fetchPasswords(account: testAccount)
+    expect("清空后为空列表", emptied.isEmpty, "实际 \(emptied.count) 个：\(emptied)")
+
+    // 清理测试条目
+    _ = runProcess("/usr/bin/security",
+                   ["delete-generic-password", "-a", testAccount, "-s", kKeychainService])
+
     print()
     if failed == 0 {
         print("结果: 全部通过 ✓")
@@ -808,6 +1043,118 @@ if args.contains("--diag") {
 // 得到的是那个程序自己的权限，会永远是「未授权」——这正是之前的误报来源。
 if args.contains("--ax-status") {
     exit(accessibilityGranted() ? 0 : 1)
+}
+
+// 多密码管理。供设置向导与命令行共用，逻辑只在这里实现一份。
+//
+//   --passwords list [--json]        列出密码（默认打码）
+//   --passwords add   --stdin        从标准输入读一行作为新密码
+//   --passwords set   --stdin        整体替换（读一行一个，空行结束）
+//   --passwords remove --index N     删除第 N 个（从 1 开始）
+//   --passwords clear                清空
+if let idx = args.firstIndex(of: "--passwords") {
+    let jsonOut = args.contains("--json")
+    let account = loadConfig()?.keychainAccount ?? NSUserName()
+    let action = (idx + 1 < args.count) ? args[idx + 1] : "list"
+    var list = fetchPasswords(account: account)
+
+    /// 读取标准输入中的密码。
+    ///
+    /// - Parameter single: true 只读一行（add）；false 读到空行或 EOF 为止（set）
+    ///
+    /// 注意：输入是按行传输的，因此**密码本身不能包含换行符**——
+    /// 含换行的密码会被拆成两条，所以这里直接拒绝并报错，而不是静默拆开。
+    /// 实践中登录密码含换行极为罕见，界面上的密码框也无法输入换行。
+    func readLines(single: Bool) -> [String] {
+        var lines: [String] = []
+        while let line = readLine(strippingNewline: true) {
+            if single {
+                if !line.isEmpty { lines.append(line) }
+                break
+            }
+            if line.isEmpty { break }   // 空行结束
+            lines.append(line)
+        }
+        return lines
+    }
+
+    switch action {
+    case "list":
+        // --values：以 JSON 数组输出原始密码，供设置向导精确读取。
+        // 不能逐行输出——密码本身可能含换行符，会一条被拆成两条。
+        // JSON 会把换行转义，能精确承载任意字符。
+        if args.contains("--values") {
+            if let data = try? JSONSerialization.data(withJSONObject: list),
+               let text = String(data: data, encoding: .utf8) {
+                print(text)
+            } else {
+                print("[]")
+            }
+            exit(0)
+        }
+        if jsonOut {
+            printJSON(["count": list.count, "lengths": list.map { $0.count }])
+        } else {
+            if list.isEmpty {
+                print("尚未保存任何密码。")
+            } else {
+                print("已保存 \(list.count) 个密码（按尝试顺序）：")
+                for (n, pw) in list.enumerated() {
+                    print("  \(n + 1). \(String(repeating: "•", count: max(pw.count, 1)))  （\(pw.count) 字符）")
+                }
+            }
+        }
+        exit(0)
+
+    case "add":
+        let newOnes = readLines(single: true)
+        guard !newOnes.isEmpty else {
+            if jsonOut { printJSON(["ok": false, "error": "没有从标准输入读到密码"]) }
+            else { FileHandle.standardError.write("没有从标准输入读到密码\n".data(using: .utf8)!) }
+            exit(2)
+        }
+        list.append(contentsOf: newOnes)
+        let ok = storePasswords(list, account: account)
+        if jsonOut { printJSON(["ok": ok, "count": list.count]) }
+        else { print(ok ? "已添加，共 \(list.count) 个密码。" : "写入钥匙串失败。") }
+        exit(ok ? 0 : 1)
+
+    case "set":
+        let newList = readLines(single: false)
+        guard !newList.isEmpty else {
+            if jsonOut { printJSON(["ok": false, "error": "没有从标准输入读到密码"]) }
+            else { FileHandle.standardError.write("没有从标准输入读到密码\n".data(using: .utf8)!) }
+            exit(2)
+        }
+        let ok = storePasswords(newList, account: account)
+        if jsonOut { printJSON(["ok": ok, "count": newList.count]) }
+        else { print(ok ? "已设置为 \(newList.count) 个密码。" : "写入钥匙串失败。") }
+        exit(ok ? 0 : 1)
+
+    case "remove":
+        guard let vidx = args.firstIndex(of: "--index"), vidx + 1 < args.count,
+              let oneBased = Int(args[vidx + 1]), oneBased >= 1, oneBased <= list.count else {
+            let msg = "索引无效（范围为 1..\(list.count)）"
+            if jsonOut { printJSON(["ok": false, "error": msg]) } else { print(msg) }
+            exit(2)
+        }
+        list.remove(at: oneBased - 1)
+        let ok = storePasswords(list, account: account)
+        if jsonOut { printJSON(["ok": ok, "count": list.count]) }
+        else { print(ok ? "已删除，剩余 \(list.count) 个密码。" : "写入钥匙串失败。") }
+        exit(ok ? 0 : 1)
+
+    case "clear":
+        let ok = storePasswords([], account: account)
+        if jsonOut { printJSON(["ok": ok, "count": 0]) }
+        else { print(ok ? "已清空全部密码。" : "写入钥匙串失败。") }
+        exit(ok ? 0 : 1)
+
+    default:
+        let msg = "未知操作：\(action)（可用：list/add/set/remove/clear）"
+        if jsonOut { printJSON(["ok": false, "error": msg]) } else { print(msg) }
+        exit(2)
+    }
 }
 
 if args.contains("--check") {

@@ -122,28 +122,56 @@ func runInstallerTests() {
         check("plist 可解析", false)
     }
 
-    // ---- 4. 钥匙串（真实写入，但用临时服务名）----
+    // ---- 4. 钥匙串与多密码（真实写入，但用临时服务名）----
+    //
+    // 这里刻意使用向导实际调用的 loadPasswords / savePasswords，
+    // 而不是自己拼 security 命令——保证测的是真实路径。
     print()
-    print("== 4. 登录密码写入钥匙串 ==")
-    switch installer.storePassword(testPassword) {
-    case .failed(let e):
-        check("storePassword", false, e.replacingOccurrences(of: "\n", with: " "))
-    case .ok:
-        check("storePassword 成功", true)
-    }
-    let readBack = installer.verifyPassword()
-    check("回读成功", readBack != nil)
-    check("回读内容与写入一致", readBack == testPassword,
-          "写入 \(testPassword.count) 字符，回读 \(readBack?.count ?? -1) 字符")
+    print("== 4. 登录密码（多密码）==")
 
-    let second = testPassword + "-v2"
-    switch installer.storePassword(second) {
-    case .failed(let e):
-        check("覆盖写入", false, e.replacingOccurrences(of: "\n", with: " "))
-    case .ok:
-        check("覆盖写入成功", true)
-    }
-    check("覆盖后回读为新值", installer.verifyPassword() == second)
+    let multi = ["first-password", "second-password", "third-password"]
+    check("savePasswords 成功", installer.savePasswords(multi),
+          installer.lastPasswordError)
+    let loaded = installer.loadPasswords()
+    check("读回数量正确", loaded.count == multi.count, "实际 \(loaded.count)")
+    check("顺序与内容一致", loaded == multi, "实际 \(loaded)")
+    check("密码未因换行被拆开", loaded.allSatisfy { !$0.isEmpty },
+          "出现空密码项")
+
+    // 含换行的密码必须被明确拒绝，而不是静默拆成两条
+    check("拒绝含换行的密码",
+          installer.savePasswords(["line-one\nline-two", "normal"]) == false)
+    check("拒绝后原密码未被破坏", installer.loadPasswords() == multi,
+          "实际 \(installer.loadPasswords())")
+
+    // 特殊字符（引号、反斜杠、空格、中文）必须能原样存取
+    let tricky = ["p@ss w0rd", "with\"quote", "with\\backslash", "中文密码", "$dollar`tick"]
+    check("特殊字符可保存", installer.savePasswords(tricky), installer.lastPasswordError)
+    check("特殊字符原样读回", installer.loadPasswords() == tricky,
+          "实际 \(installer.loadPasswords())")
+
+    // 单个密码（最常见情形）仍要正常
+    check("单密码可用", installer.savePasswords(["only-one"]), installer.lastPasswordError)
+    check("单密码读回正确", installer.loadPasswords() == ["only-one"])
+    _ = installer.savePasswords(multi)
+
+    // 空列表必须被拒绝，否则解锁会失败
+    check("拒绝空密码列表", installer.savePasswords([]) == false)
+    check("拒绝后原密码仍在", installer.loadPasswords() == multi)
+
+    // 顺序敏感：把列表倒过来应如实保存
+    _ = installer.savePasswords(multi.reversed())
+    check("顺序可调整", installer.loadPasswords() == multi.reversed(),
+          "实际 \(installer.loadPasswords())")
+    _ = installer.savePasswords(multi)
+
+    // 旧格式兼容：钥匙串里直接放明文（老版本就是这么存的）
+    _ = runFull("/usr/bin/security",
+                ["add-generic-password", "-U", "-a", NSUserName(),
+                 "-s", Const.keychainService, "-w", "legacy-plain-password"])
+    check("旧格式单密码可识别", installer.loadPasswords() == ["legacy-plain-password"],
+          "实际 \(installer.loadPasswords())")
+    _ = installer.savePasswords(multi)
 
     // ---- 5. 升级幂等 ----
     print()

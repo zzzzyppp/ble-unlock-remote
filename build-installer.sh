@@ -142,6 +142,7 @@ swiftc -O -suppress-warnings \
     "$BUILD/BuildInfo.swift" \
     installer-src/app/Installer.swift \
     installer-src/app/SetupWindow.swift \
+    installer-src/app/PasswordEditor.swift \
     installer-src/app/AppDelegate.swift \
     installer-src/app/main.swift \
     -o "$APP_BIN" \

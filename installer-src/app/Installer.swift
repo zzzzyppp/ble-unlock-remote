@@ -173,9 +173,15 @@ enum StepResult {
     case failed(String)
 }
 
-struct Installer {
+/// 安装逻辑。用 class 而非 struct：它持有可变状态（lastPasswordError 等），
+/// 且被多个界面共享，引用语义更合适。
+final class Installer {
 
     var log: (String) -> Void
+
+    init(log: @escaping (String) -> Void) {
+        self.log = log
+    }
 
     // ---- 1. 复制服务端 ----
 
@@ -353,6 +359,64 @@ struct Installer {
     func hasPassword() -> Bool {
         run("/usr/bin/security",
             ["find-generic-password", "-a", NSUserName(), "-s", Const.keychainService]).code == 0
+    }
+
+    // ---- 多密码管理 ----
+
+    /// 最近一次密码操作的错误说明
+    private(set) var lastPasswordError = ""
+
+    /// 读取当前保存的全部密码。
+    ///
+    /// 用 JSON 数组传输，而不是逐行输出：密码本身可能包含换行符，
+    /// 逐行会被拆成两个错误的密码。JSON 会转义换行，可精确承载任意字符。
+    func loadPasswords() -> [String] {
+        let r = runFull(Const.serviceBin.path, ["--passwords", "list", "--values"])
+        guard r.code == 0 else {
+            lastPasswordError = "读取密码失败：\(r.summary)"
+            log(lastPasswordError)
+            return []
+        }
+        let text = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = text.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [String] else {
+            lastPasswordError = "密码数据格式异常"
+            log("\(lastPasswordError)：\(text.prefix(80))")
+            return []
+        }
+        // 统一 NFC：macOS 钥匙串存 NFD（é = e + 组合重音），输入常为 NFC，
+        // 两者渲染相同但码点不同，会造成比较假失败。
+        return arr.filter { !$0.isEmpty }.map { $0.precomposedStringWithCanonicalMapping }
+    }
+
+    /// 写回全部密码
+    func savePasswords(_ passwords: [String]) -> Bool {
+        let clean = passwords.filter { !$0.isEmpty }
+            .map { $0.precomposedStringWithCanonicalMapping }
+        guard !clean.isEmpty else {
+            lastPasswordError = "至少要保留一个密码，否则解锁会失败。"
+            return false
+        }
+        // 输入是按行传输的，含换行的密码会被拆开，因此明确拒绝
+        if let bad = clean.first(where: { $0.contains("\n") || $0.contains("\r") }) {
+            lastPasswordError = """
+            密码不能包含换行符。
+
+            其中有 \(bad.count) 个字符的密码含换行，请重新输入。
+            """
+            log("拒绝保存：密码含换行符")
+            return false
+        }
+        // 每个密码一行，末尾空行表示结束（与服务端约定）
+        let payload = clean.joined(separator: "\n") + "\n\n"
+        let r = runFull(Const.serviceBin.path, ["--passwords", "set", "--json"], input: payload)
+        guard r.code == 0, r.out.contains("\"ok\":true") else {
+            lastPasswordError = "写入钥匙串失败：\(r.summary)"
+            log(lastPasswordError)
+            return false
+        }
+        log("已保存 \(clean.count) 个密码")
+        return true
     }
 
     /// 回读钥匙串里的密码，确认写入成功。

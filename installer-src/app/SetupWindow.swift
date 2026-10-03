@@ -23,10 +23,13 @@ final class SetupWindow: NSObject {
     private let passwordLabel = NSTextField(labelWithString: "登录密码：")
     private let primaryButton = NSButton()
     private let secondaryButton = NSButton()
+    private let manageButton = NSButton()
 
     /// 点击主按钮时的回调，参数是当前阶段
     var onPrimary: ((Stage) -> Void)?
     var onSecondary: (() -> Void)?
+    /// 点击「管理密码」
+    var onManagePasswords: (() -> Void)?
 
     /// 由 AppDelegate 注入，便于界面直接触发安装动作
     var installer: Installer?
@@ -103,8 +106,15 @@ final class SetupWindow: NSObject {
         secondaryButton.action = #selector(secondaryClicked)
         secondaryButton.translatesAutoresizingMaskIntoConstraints = false
 
+        // 管理密码：任何时候都可用，方便用户随时增删多个密码
+        manageButton.title = "管理密码（可添加多个）"
+        manageButton.bezelStyle = .rounded
+        manageButton.target = self
+        manageButton.action = #selector(manageClicked)
+        manageButton.translatesAutoresizingMaskIntoConstraints = false
+
         for v in [titleLabel, descLabel, progress, scroll, passwordLabel,
-                  passwordField, primaryButton, secondaryButton] {
+                  passwordField, primaryButton, secondaryButton, manageButton] {
             content.addSubview(v)
         }
 
@@ -142,6 +152,9 @@ final class SetupWindow: NSObject {
             primaryButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -m),
             primaryButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -m),
             primaryButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+
+            manageButton.centerYAnchor.constraint(equalTo: primaryButton.centerYAnchor),
+            manageButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: m),
 
             scroll.bottomAnchor.constraint(equalTo: primaryButton.topAnchor, constant: -14),
         ])
@@ -273,6 +286,14 @@ final class SetupWindow: NSObject {
 
     @objc private func secondaryClicked() {
         onSecondary?()
+    }
+
+    @objc private func manageClicked() {
+        onManagePasswords?()
+    }
+
+    func setManageEnabled(_ enabled: Bool) {
+        manageButton.isEnabled = enabled
     }
 
     func present() {
