@@ -181,9 +181,14 @@ struct Installer {
 
     func installService() -> StepResult {
         let fm = FileManager.default
-        let res = Bundle.main.resourceURL!
 
-        // 已存在则先停服务并移除旧版本
+        // 安装包内的服务端以完整 app 形式提供（嵌套 bundle），
+        // 整体复制过去即可——它自带 Info.plist（含蓝牙用途说明）与能力标记。
+        guard let embedded = Bundle.main.url(forResource: "BLEUnlockCmd", withExtension: "app") else {
+            return .failed("安装包内缺少服务端（Resources/BLEUnlockCmd.app）")
+        }
+
+        // 已存在则先停服务再替换
         if fm.fileExists(atPath: Const.serviceApp.path) {
             log("检测到已安装，正在更新…")
             stopService()
@@ -194,62 +199,35 @@ struct Installer {
             try fm.createDirectory(at: Const.supportDir,
                                    withIntermediateDirectories: true,
                                    attributes: [.posixPermissions: 0o700])
-            // 只复制服务端可执行文件，App 外壳（Info.plist 等）由安装器生成，
-            // 这样版本升级时结构可控，也避免依赖包内的相对布局
-            let binDir = Const.serviceApp.appendingPathComponent("Contents/MacOS")
-            try fm.createDirectory(at: binDir, withIntermediateDirectories: true)
-            try fm.createDirectory(
-                at: Const.serviceApp.appendingPathComponent("Contents/Resources"),
-                withIntermediateDirectories: true)
-
-            guard let srcBin = Bundle.main.url(forResource: "BLEUnlockCmd", withExtension: nil) else {
-                return .failed("安装包内缺少服务端程序（BLEUnlockCmd）")
+            // 用 ditto 而非 copyItem：ditto 能完整保留嵌套代码的签名与扩展属性，
+            // 直接复制目录有可能破坏签名，导致辅助功能授权失效。
+            let ditto = runFull("/usr/bin/ditto", [embedded.path, Const.serviceApp.path])
+            if ditto.code != 0 {
+                return .failed("复制服务端失败：\(ditto.summary)")
             }
-            try fm.copyItem(at: srcBin, to: Const.serviceBin)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: Const.serviceBin.path)
+            try fm.setAttributes([.posixPermissions: 0o755],
+                                 ofItemAtPath: Const.serviceBin.path)
         } catch {
             return .failed("复制服务端失败：\(error.localizedDescription)")
         }
 
-        // Info.plist：蓝牙权限说明是 macOS 弹出授权框的前提
-        let plist = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>CFBundleExecutable</key><string>BLEUnlockCmd</string>
-            <key>CFBundleIdentifier</key><string>\(Const.bundleID)</string>
-            <key>CFBundleName</key><string>BLEUnlockCmd</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>\(AppInfo.serviceVersion)</string>
-            <key>CFBundleVersion</key><string>1</string>
-            <key>LSMinimumSystemVersion</key><string>11.0</string>
-            <key>LSUIElement</key><true/>
-            <key>NSBluetoothAlwaysUsageDescription</key>
-            <string>BLEUnlockCmd 需要通过蓝牙接收手机发来的解锁指令。</string>
-            <key>NSBluetoothPeripheralUsageDescription</key>
-            <string>BLEUnlockCmd 需要通过蓝牙接收手机发来的解锁指令。</string>
-        </dict>
-        </plist>
-        """
-        do {
-            try plist.write(to: Const.serviceApp.appendingPathComponent("Contents/Info.plist"),
-                            atomically: true, encoding: .utf8)
-        } catch {
-            return .failed("写入 Info.plist 失败：\(error.localizedDescription)")
+        // 兜底：若包内服务端没有签名（例如手工替换过），补一次
+        if runFull("/usr/bin/codesign", ["-v", Const.serviceApp.path]).code != 0 {
+            log("包内服务端未签名，补签一次")
+            _ = run("/usr/bin/codesign",
+                    ["--force", "--sign", "-", "--identifier", Const.bundleID,
+                     Const.serviceApp.path])
         }
 
-        // 能力标记：安装器靠它判断二进制是否支持 --ax-status
-        try? "name=BLEUnlockCmd\nversion=\(AppInfo.serviceVersion)\nfeatures=ax-status\n"
-            .write(to: Const.serviceApp.appendingPathComponent("Contents/Resources/capabilities"),
-                   atomically: true, encoding: .utf8)
+        guard fm.isExecutableFile(atPath: Const.serviceBin.path) else {
+            return .failed("服务端可执行文件缺失：\(Const.serviceBin.path)")
+        }
+        guard FileManager.default.fileExists(
+            atPath: Const.serviceApp.appendingPathComponent("Contents/Info.plist").path) else {
+            return .failed("服务端 Info.plist 缺失，安装包可能不完整")
+        }
 
-        // 临时签名：辅助功能权限与签名绑定，签名稳定则权限不会因重装失效。
-        // 直接调用 codesign，不经 shell——避免触发「终端想控制其他 App」的授权提示。
-        _ = run("/usr/bin/codesign",
-                ["--force", "--sign", "-", "--identifier", Const.bundleID, Const.serviceApp.path])
-
-        log("服务端已安装")
+        log("服务端已安装（嵌套 app）")
         return .ok("服务端已安装")
     }
 

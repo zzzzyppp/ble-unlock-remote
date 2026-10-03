@@ -39,6 +39,12 @@ DIST="$SCRIPT_DIR/dist"
 APP="$BUILD/$APP_NAME.app"
 APP_BIN="$APP/Contents/MacOS/$EXEC_NAME"
 APP_RES="$APP/Contents/Resources"
+# 服务端以「嵌套的 .app」形式打包，而不是裸二进制：
+#   ~/Library/Application Support/BLEUnlockCmd/BLEUnlockCmd.app
+# 这样它有完整身份（Info.plist 里的蓝牙用途说明、稳定的 Bundle ID），
+# 既是 macOS 的规范做法，也避免将来系统弹蓝牙授权框时因缺少用途说明被拒。
+SERVICE_APP="$APP_RES/BLEUnlockCmd.app"
+SERVICE_BIN="$SERVICE_APP/Contents/MacOS/BLEUnlockCmd"
 STAGE="$BUILD/dmg-stage"
 DMG="$DIST/BLEUnlock-${VERSION}-${ARCH}.dmg"
 
@@ -70,20 +76,53 @@ mkdir -p "$APP/Contents/MacOS" "$APP_RES" "$STAGE" "$DIST"
 # ---------------------------------------------------------------- 1. 服务端（预编译）
 
 info "编译服务端（${ARCH}）"
+mkdir -p "$SERVICE_APP/Contents/MacOS" "$SERVICE_APP/Contents/Resources"
 swiftc -O -suppress-warnings \
     -module-cache-path "$SCRIPT_DIR/.cache" \
     -target "${ARCH}-apple-macos${MIN_MACOS}" \
     mac-src/main.swift \
-    -o "$APP_RES/BLEUnlockCmd" \
+    -o "$SERVICE_BIN" \
     || die "服务端编译失败"
-chmod 755 "$APP_RES/BLEUnlockCmd"
+chmod 755 "$SERVICE_BIN"
 
-# 预签名：设置向导会连同签名一起复制到安装位置，使辅助功能权限绑定到
-# 稳定的签名标识。标识必须与向导写入 Info.plist 的一致。
-codesign --force --sign - --identifier "$SERVICE_BUNDLE_ID" \
-    "$APP_RES/BLEUnlockCmd" >/dev/null 2>&1 \
-    && ok "服务端已预签名" || warn "服务端签名失败（设置时仍会重签）"
-ok "服务端：$(file -b "$APP_RES/BLEUnlockCmd" | cut -d, -f1)"
+# 服务端自己的 Info.plist。蓝牙用途说明是 macOS 弹出蓝牙授权框的前提，
+# 裸二进制没有 bundle 就没有这个说明书，授权框可能直接被拒。
+cat > "$SERVICE_APP/Contents/Info.plist" <<SPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key><string>BLEUnlockCmd</string>
+    <key>CFBundleIdentifier</key><string>${SERVICE_BUNDLE_ID}</string>
+    <key>CFBundleName</key><string>BLEUnlockCmd</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>${MIN_MACOS}</string>
+    <key>LSUIElement</key><true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>BLEUnlockCmd 需要通过蓝牙接收手机发来的解锁指令。</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>BLEUnlockCmd 需要通过蓝牙接收手机发来的解锁指令。</string>
+</dict>
+</plist>
+SPLIST
+
+printf 'APPL????' > "$SERVICE_APP/Contents/PkgInfo"
+
+# 能力标记：设置向导靠它判断二进制是否支持 --ax-status。
+# 不能 grep 二进制——Swift 会合并参数字符串，查不到。
+cat > "$SERVICE_APP/Contents/Resources/capabilities" <<CAPS
+name=BLEUnlockCmd
+version=${VERSION}
+features=ax-status
+CAPS
+
+# 里外都要签名，且必须由内向外：先签嵌套的服务端，再签外层设置 App，
+# 否则外层签名会因内容变化而失效。
+codesign --force --sign - --identifier "$SERVICE_BUNDLE_ID" "$SERVICE_APP" >/dev/null 2>&1 \
+    && ok "服务端已签名（嵌套 app）" || warn "服务端签名失败"
+ok "服务端：$(file -b "$SERVICE_BIN" | cut -d, -f1)"
 
 # ---------------------------------------------------------------- 2. 设置向导界面
 
@@ -180,18 +219,23 @@ info "自检"
 MOUNT=$(hdiutil attach "$DMG" -nobrowse -readonly 2>/dev/null | grep -o '/Volumes/.*' | head -1)
 if [ -n "$MOUNT" ]; then
     INNER="$MOUNT/$APP_NAME.app/Contents"
+    NESTED="$INNER/Resources/BLEUnlockCmd.app"
     [ -x "$INNER/MacOS/$EXEC_NAME" ] && ok "设置向导可执行文件存在" || warn "设置向导缺失"
-    [ -x "$INNER/Resources/BLEUnlockCmd" ] && ok "服务端二进制存在" || warn "服务端二进制缺失"
+    [ -x "$NESTED/Contents/MacOS/BLEUnlockCmd" ] \
+        && ok "嵌套服务端 app 存在" || warn "嵌套服务端缺失"
+    [ -f "$NESTED/Contents/Info.plist" ] \
+        && ok "服务端 Info.plist 存在（含蓝牙用途说明）" || warn "服务端 Info.plist 缺失"
     [ -L "$MOUNT/Applications" ] && ok "存在「应用程序」快捷方式（可拖拽安装）" || warn "缺少 Applications 链接"
-    if "$INNER/Resources/BLEUnlockCmd" --version >/dev/null 2>&1; then
-        ok "服务端可运行（$("$INNER/Resources/BLEUnlockCmd" --version)）"
+    if "$NESTED/Contents/MacOS/BLEUnlockCmd" --version >/dev/null 2>&1; then
+        ok "服务端可运行（$("$NESTED/Contents/MacOS/BLEUnlockCmd" --version)）"
     else
         warn "服务端无法运行"
     fi
-    codesign -v "$MOUNT/$APP_NAME.app" >/dev/null 2>&1 \
-        && ok "App 签名有效" || warn "App 签名校验未通过"
-    codesign -v "$INNER/Resources/BLEUnlockCmd" >/dev/null 2>&1 \
-        && ok "服务端签名有效" || warn "服务端签名校验未通过"
+    # 嵌套代码必须先验证，再验证外层
+    codesign -v "$NESTED" >/dev/null 2>&1 \
+        && ok "嵌套服务端签名有效" || warn "嵌套服务端签名校验未通过"
+    codesign -v --deep --strict "$MOUNT/$APP_NAME.app" >/dev/null 2>&1 \
+        && ok "设置 App 签名有效（含嵌套代码）" || warn "App 签名校验未通过"
     hdiutil detach "$MOUNT" >/dev/null 2>&1
     ok "已卸载测试卷"
 else

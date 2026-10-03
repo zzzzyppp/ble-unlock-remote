@@ -54,6 +54,10 @@ func runInstallerTests() {
 
     let infoPlist = (try? String(contentsOf: Const.serviceApp
         .appendingPathComponent("Contents/Info.plist"), encoding: .utf8)) ?? ""
+    check("服务端为完整 app（含 Info.plist）",
+          exists(Const.serviceApp.appendingPathComponent("Contents/Info.plist")))
+    check("服务端含 PkgInfo",
+          exists(Const.serviceApp.appendingPathComponent("Contents/PkgInfo")))
     check("Info.plist 含 CFBundleIdentifier", infoPlist.contains(Const.bundleID))
     check("Info.plist 含蓝牙权限说明", infoPlist.contains("NSBluetoothAlwaysUsageDescription"))
 
@@ -176,8 +180,23 @@ func runInstallerTests() {
     let capsBackup = (try? String(contentsOf: capsURL, encoding: .utf8)) ?? ""
     try? FileManager.default.removeItem(at: capsURL)
 
-    check("移除 capabilities 后 hasAccessibility 返回 false",
-          installer.hasAccessibility() == false)
+    // 注意：这里用的是 childProcessAccessibility —— 子进程视角的判定。
+    // 真正决定解锁能否成功的是守护进程自己的判定（daemonAccessibility），
+    // 因为 TCC 的信任会从父进程继承，子进程会假报已授权。
+    check("移除 capabilities 后子进程查询返回 false",
+          installer.childProcessAccessibility() == false)
+
+    // 守护进程状态文件的读取
+    installer.clearDaemonStatus()
+    check("清除后 daemonAccessibility 返回 nil", installer.daemonAccessibility() == nil)
+    let fakeStatus = Const.supportDir.appendingPathComponent("daemon-status.json")
+    try? "{\"axTrusted\": false, \"pid\": 1}".write(to: fakeStatus, atomically: true, encoding: .utf8)
+    check("能读到 axTrusted=false", installer.daemonAccessibility() == false)
+    try? "{\"axTrusted\": true, \"pid\": 1}".write(to: fakeStatus, atomically: true, encoding: .utf8)
+    check("能读到 axTrusted=true", installer.daemonAccessibility() == true)
+    try? "不是 JSON".write(to: fakeStatus, atomically: true, encoding: .utf8)
+    check("损坏的状态文件返回 nil", installer.daemonAccessibility() == nil)
+    installer.clearDaemonStatus()
 
     // 关键：不能留下 --ax-status 孤儿进程
     let orphans = runFull("/usr/bin/pgrep", ["-fl", "--ax-status"])

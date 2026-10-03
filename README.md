@@ -293,6 +293,31 @@ export ANDROID_SDK_ROOT="$PWD/toolchain/android-sdk"
 > 已知问题：build-tools **34.0.0** 自带的 d8 处理本项目代码时会内部报错（R8 的 NPE），
 > 因此 `build.sh` 会自动优先选用 35.0.0+。
 
+### 安装包内部结构
+
+服务端以「嵌套 app」形式打进设置 App，而不是散落的裸二进制：
+
+```
+BLE Unlock.app                          ← 拖进「应用程序」的设置 App
+└── Contents/
+    ├── MacOS/BLEUnlockSetup            ← 设置向导
+    └── Resources/
+        └── BLEUnlockCmd.app            ← 嵌套的服务端（安装时整体复制出去）
+            └── Contents/
+                ├── Info.plist          ← 含蓝牙用途说明，是弹授权框的前提
+                ├── PkgInfo
+                ├── MacOS/BLEUnlockCmd  ← 实际执行解锁的守护进程
+                └── Resources/capabilities  ← 能力标记
+```
+
+签名由内向外：先签嵌套的服务端，再签外层设置 App；安装时用 `ditto`
+整体复制，以保留嵌套代码的签名与扩展属性。
+
+> 安装后服务端位于
+> `~/Library/Application Support/BLEUnlockCmd/BLEUnlockCmd.app`。
+> **「辅助功能」授权要授予这个位置的可执行文件**，而不是「应用程序」里的
+> BLE Unlock —— 后者只是设置 App，授权给它不会让后台服务获得权限。
+
 ### APK 签名密钥
 
 密钥**不在仓库里**。`build.sh` 按以下顺序查找：
