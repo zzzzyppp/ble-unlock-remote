@@ -68,8 +68,8 @@ TARGET_SDK="34"
 
 # 版本号：每次改动功能都应递增 versionCode，否则手机上无法覆盖安装。
 # 可用环境变量临时覆盖：VERSION_CODE=3 VERSION_NAME=1.2.0 ./build.sh
-VERSION_CODE="${VERSION_CODE:-2}"
-VERSION_NAME="${VERSION_NAME:-1.1.0}"
+VERSION_CODE="${VERSION_CODE:-3}"
+VERSION_NAME="${VERSION_NAME:-1.2.0}"
 
 if [ -t 1 ]; then
     C_RESET=$'\033[0m'; C_GREEN=$'\033[32m'; C_RED=$'\033[31m'

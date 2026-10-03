@@ -68,6 +68,23 @@ public class VerifyProtocol {
                 message[28] == 0 && message[29] == 0, "非 0");
 
         System.out.println();
+        System.out.println("== 1b. 指定密码解锁（CMD_UNLOCK_FROM）==");
+        // 手机选"用第几个密码"时，指令码变成 0x04，序号放在字节 28（HMAC 保护范围内）。
+        for (int idx : new int[]{0, 1, 2, 7, 255}) {
+            byte[] msg = buildMessage(0x04, idx);
+            boolean cmdOk = msg[3] == 0x04;
+            boolean idxOk = (msg[28] & 0xFF) == idx;
+            boolean reservedOk = msg[29] == 0;
+            check("序号 " + idx + " 编码正确（指令 0x04，字节28=" + idx + "）",
+                  cmdOk && idxOk && reservedOk,
+                  "cmd=" + msg[3] + " b28=" + (msg[28] & 0xFF) + " b29=" + msg[29]);
+        }
+        // 普通解锁不应带序号语义
+        byte[] plain = buildMessage(0x01, -1);
+        check("普通解锁字节 28 保持为 0", plain[28] == 0 && plain[29] == 0,
+              "b28=" + plain[28] + " b29=" + plain[29]);
+
+        System.out.println();
         System.out.println("== 2. Java 端 HMAC-SHA256 ==");
         byte[] javaTag = hmac(KEY, message);
         String javaTagHex = hex.formatHex(javaTag);
@@ -124,13 +141,26 @@ public class VerifyProtocol {
         }
     }
 
-    /** 按协议拼出 30 字节待签名消息 */
+    /** 按协议拼出 30 字节待签名消息（默认指令） */
     static byte[] buildMessage() {
+        return buildMessage(CMD, -1);
+    }
+
+    /**
+     * 按协议拼出 30 字节待签名消息。
+     *
+     * @param command       指令码
+     * @param passwordIndex 密码序号（0 基）；负数表示不指定，字节 28 保持 0
+     */
+    static byte[] buildMessage(byte command, int passwordIndex) {
         byte[] m = new byte[30];
         m[0] = 0x42;
         m[1] = 0x55;
         m[2] = 0x01;
-        m[3] = CMD;
+        m[3] = command;
+        if (passwordIndex >= 0) {
+            m[28] = (byte) passwordIndex;
+        }
         ByteBuffer ts = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN);
         ts.putLong(TS);
         System.arraycopy(ts.array(), 0, m, 4, 8);

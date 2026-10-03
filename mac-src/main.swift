@@ -26,9 +26,13 @@ let kVersion: UInt8 = 0x01
 let kCmdUnlock: UInt8 = 0x01
 let kCmdLock: UInt8 = 0x02
 let kCmdPing: UInt8 = 0x03
+/// 指定用第几个密码解锁（手机端选择"填充哪个密码"）
+let kCmdUnlockFrom: UInt8 = 0x04
 
 let kPacketLen  = 62                        // 2 magic + 1 ver + 1 cmd + 8 ts + 16 nonce + 32 hmac
 let kHmacOffset = 30                        // HMAC 覆盖前 30 字节
+/// 字节 28：密码序号（0 基）。仅 kCmdUnlockFrom 使用；位于 HMAC 覆盖范围内，长度不变。
+let kIndexOffset = 28
 
 let kTimestampSkew: Int64 = 120             // 允许的时钟偏差（秒）
 let kNonceCacheLimit = 512
@@ -174,6 +178,25 @@ func storePasswords(_ passwords: [String], account: String) -> Bool {
         return false
     }
     return writeKeychainPassword(json, account: account)
+}
+
+/// 从报文中取出密码序号。
+///
+/// 只有「指定密码解锁」（kCmdUnlockFrom）会用到字节 28。
+/// 其他指令该字节为 0，这里返回 nil，避免被误当成"第 0 个密码"。
+func extractPasswordIndex(_ bytes: [UInt8]) -> UInt8? {
+    guard bytes.count > kIndexOffset, bytes[3] == kCmdUnlockFrom else { return nil }
+    return bytes[kIndexOffset]
+}
+
+/// 把第 index 个密码提到最前面，其余保持相对顺序。
+/// 序号越界时原样返回，不抛错——调用方据此回退到默认顺序。
+func promotePassword(_ list: [String], toFront index: Int) -> [String] {
+    guard index > 0, index < list.count else { return list }
+    var out = list
+    let picked = out.remove(at: index)
+    out.insert(picked, at: 0)
+    return out
 }
 
 /// 兼容旧接口：返回第一个密码
@@ -368,7 +391,11 @@ func accessibilityGranted(prompt: Bool = false) -> Bool {
 var unlockInFlight = false
 
 /// 自动解锁：唤醒屏幕 -> 确认处于锁屏 -> 注入密码
-func performUnlock(reply: @escaping (String) -> Void) {
+/// - Parameter preferredIndex: 优先尝试第几个密码（0 基）。为 nil 时按保存顺序。
+///   手机端可以指定"用哪个密码解锁"；若指定的序号越界或该密码不对，
+///   会自动回退到按原顺序继续尝试其余密码。
+func performUnlock(preferredIndex: UInt8? = nil,
+                   reply: @escaping (String) -> Void) {
     guard !unlockInFlight else {
         reply("BUSY")
         return
@@ -385,11 +412,24 @@ func performUnlock(reply: @escaping (String) -> Void) {
         return
     }
 
-    let passwords = fetchPasswords(account: config.keychainAccount)
-    guard !passwords.isEmpty else {
+    let saved = fetchPasswords(account: config.keychainAccount)
+    guard !saved.isEmpty else {
         log("解锁失败：钥匙串中读不到密码")
         reply("ERR_NO_PW")
         return
+    }
+
+    // 手机可以指定优先用哪个密码：把该密码提到最前面，
+    // 其余保持原顺序作为回退——这样指定的密码不对时仍能自动试到对的。
+    var passwords = saved
+    if let idx = preferredIndex {
+        let i = Int(idx)
+        if i >= 0 && i < saved.count {
+            passwords = promotePassword(saved, toFront: i)
+            log("手机指定优先使用第 \(i + 1) 个密码（共 \(saved.count) 个）")
+        } else {
+            log("手机指定的密码序号 \(i + 1) 越界（共 \(saved.count) 个），按默认顺序尝试")
+        }
     }
 
     if dryRun {
@@ -528,7 +568,8 @@ let nonceCache = NonceCache()
 // MARK: - 数据包校验
 
 enum VerifyResult {
-    case ok(command: UInt8)
+    /// command 指令；index 为字节 28 的密码序号（仅指定密码时有效）
+    case ok(command: UInt8, index: UInt8?)
     case failed(String)
 }
 
@@ -556,7 +597,7 @@ func verifyPacket(_ data: Data, key: SymmetricKey) -> VerifyResult {
     for i in 0..<expected.count { diff |= expected[i] ^ received[i] }
     guard diff == 0 else { return .failed("ERR_HMAC") }
 
-    return .ok(command: bytes[3])
+    return .ok(command: bytes[3], index: extractPasswordIndex(bytes))
 }
 
 // MARK: - BLE 外设
@@ -695,8 +736,15 @@ final class PeripheralServer: NSObject, CBPeripheralManagerDelegate {
                 log("校验失败: \(reason)")
                 setStatus(reason)
 
-            case .ok(let command):
+            case .ok(let command, let index):
                 switch command {
+                case kCmdUnlockFrom:
+                    // 手机指定了要用第几个密码
+                    setStatus("UNLOCKING")
+                    performUnlock(preferredIndex: index) { status in
+                        self.setStatus(status)
+                        log("解锁结果: \(status)")
+                    }
                 case kCmdUnlock:
                     setStatus("UNLOCKING")
                     performUnlock { status in
@@ -805,12 +853,14 @@ if args.contains("--selftest-protocol") {
     print("== 报文校验 ==")
 
     switch verifyPacket(makePacket(command: kCmdUnlock), key: testKey) {
-    case .ok(let c): expect("合法解锁包通过校验", c == kCmdUnlock, "命令=\(c)")
+    case .ok(let c, let i):
+        expect("合法解锁包通过校验", c == kCmdUnlock, "命令=\(c)")
+        expect("普通解锁不带密码序号", i == nil, "实际 \(String(describing: i))")
     case .failed(let r): expect("合法解锁包通过校验", false, r)
     }
 
     switch verifyPacket(makePacket(command: kCmdPing), key: testKey) {
-    case .ok(let c): expect("PING 包通过校验", c == kCmdPing, "命令=\(c)")
+    case .ok(let c, _): expect("PING 包通过校验", c == kCmdPing, "命令=\(c)")
     case .failed(let r): expect("PING 包通过校验", false, r)
     }
 
@@ -918,6 +968,50 @@ if args.contains("--selftest-protocol") {
     _ = writeKeychainPassword("legacy-plain", account: testAccount)
     let legacy = fetchPasswords(account: testAccount)
     expect("旧格式单密码可识别", legacy == ["legacy-plain"], "实际 \(legacy)")
+
+    // 报文里的密码序号解析
+    func packetWithIndex(_ idx: UInt8, command: UInt8 = kCmdUnlockFrom) -> [UInt8] {
+        var b = [UInt8](repeating: 0, count: kPacketLen)
+        b[0] = 0x42; b[1] = 0x55; b[2] = 0x01; b[3] = command
+        b[kIndexOffset] = idx
+        return b
+    }
+    expect("从报文中解析出序号 0",
+           extractPasswordIndex(packetWithIndex(0)) == 0)
+    expect("从报文中解析出序号 5",
+           extractPasswordIndex(packetWithIndex(5)) == 5)
+    expect("从报文中解析出序号 255",
+           extractPasswordIndex(packetWithIndex(255)) == 255)
+    expect("普通解锁不解析序号",
+           extractPasswordIndex(packetWithIndex(3, command: kCmdUnlock)) == nil)
+    expect("锁定指令不解析序号",
+           extractPasswordIndex(packetWithIndex(3, command: kCmdLock)) == nil)
+
+    // 手机指定密码时的排序逻辑
+    let base = ["pw-A", "pw-B", "pw-C", "pw-D"]
+    expect("指定第 3 个 → 它排到最前",
+           promotePassword(base, toFront: 2) == ["pw-C", "pw-A", "pw-B", "pw-D"],
+           "实际 \(promotePassword(base, toFront: 2))")
+    expect("指定第 1 个 → 顺序不变",
+           promotePassword(base, toFront: 0) == base,
+           "实际 \(promotePassword(base, toFront: 0))")
+    expect("指定最后一个 → 它排到最前",
+           promotePassword(base, toFront: 3) == ["pw-D", "pw-A", "pw-B", "pw-C"],
+           "实际 \(promotePassword(base, toFront: 3))")
+    expect("序号越界 → 原样返回（回退默认顺序）",
+           promotePassword(base, toFront: 99) == base,
+           "实际 \(promotePassword(base, toFront: 99))")
+    expect("负数序号 → 原样返回",
+           promotePassword(base, toFront: -1) == base)
+    expect("单元素列表不受影响",
+           promotePassword(["only"], toFront: 0) == ["only"])
+    expect("空列表不崩溃", promotePassword([], toFront: 0).isEmpty)
+
+    // 指定序号后仍应能试到全部密码（回退链完整）
+    let promoted = promotePassword(base, toFront: 2)
+    expect("排序后仍是同一组密码（无丢失）",
+           Set(promoted) == Set(base) && promoted.count == base.count,
+           "实际 \(promoted)")
 
     // 清空后应为空列表（不能把 JSON 文本 "[]" 当密码）
     storePasswords([], account: testAccount)

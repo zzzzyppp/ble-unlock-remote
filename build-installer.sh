@@ -115,7 +115,7 @@ printf 'APPL????' > "$SERVICE_APP/Contents/PkgInfo"
 cat > "$SERVICE_APP/Contents/Resources/capabilities" <<CAPS
 name=BLEUnlockCmd
 version=${VERSION}
-features=ax-status
+features=ax-status,passwords
 CAPS
 
 # 里外都要签名，且必须由内向外：先签嵌套的服务端，再签外层设置 App，

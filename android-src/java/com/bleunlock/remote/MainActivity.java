@@ -57,6 +57,7 @@ public class MainActivity extends Activity {
     private TextView detailView;
     private Button unlockButton;
     private Button connectButton;
+    private Button fillPasswordButton;
 
     private MacEntryStore store;
     private BleService service;
@@ -194,6 +195,18 @@ public class MainActivity extends Activity {
         unlockButton.setOnClickListener(v -> doSend(Protocol.CMD_UNLOCK));
         root.addView(unlockButton);
 
+        // ---- 填充密码：选择用 Mac 上的第几个密码解锁 ----
+        fillPasswordButton = new Button(this);
+        fillPasswordButton.setText("填充密码");
+        fillPasswordButton.setTextColor(Color.WHITE);
+        fillPasswordButton.setBackgroundColor(COL_GREY);
+        LinearLayout.LayoutParams fillLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        fillLp.topMargin = dp(10);
+        fillPasswordButton.setLayoutParams(fillLp);
+        fillPasswordButton.setOnClickListener(v -> showPasswordPicker());
+        root.addView(fillPasswordButton);
+
         // ---- 次要按钮 ----
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -272,6 +285,90 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------ Mac 密钥管理
 
     /** 列出所有已保存的 Mac，点击即切换 */
+    /**
+     * 选择用 Mac 上的第几个密码解锁。
+     *
+     * 手机不保存密码本身——密码只在 Mac 的钥匙串里。这里选择的是"位次"，
+     * 名字只是给用户看的标签，方便区分哪个位次对应哪个密码。
+     */
+    private void showPasswordPicker() {
+        final MacEntryStore.Entry active = store.selected();
+        if (active == null) {
+            Toast.makeText(this, "请先添加 Mac", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // 至少展示若干位次，若已配置过更多则按已配置的数量
+        final int slots = Math.max(3, Math.max(active.passwordLabels.size(),
+                active.preferredPassword + 1));
+        active.ensureLabels(slots);
+
+        String[] labels = new String[slots];
+        for (int i = 0; i < slots; i++) {
+            String mark = (i == active.preferredPassword) ? "● " : "○ ";
+            labels[i] = mark + active.labelFor(i) + "   （Mac 上第 " + (i + 1) + " 个）";
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("用哪个密码解锁")
+                .setItems(labels, (dialog, which) -> {
+                    store.setPasswordPreference(active.id, which, active.passwordLabels);
+                    renderState();
+                    Toast.makeText(this,
+                            "解锁时将优先使用「" + active.labelFor(which) + "」",
+                            Toast.LENGTH_SHORT).show();
+                })
+                .setNeutralButton("给位次起名", (dialog, which) -> showLabelEditor(active, slots))
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 给各密码位起名，便于在列表里区分 */
+    private void showLabelEditor(final MacEntryStore.Entry active, final int slots) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(20);
+        box.setPadding(pad, dp(8), pad, 0);
+
+        TextView hint = new TextView(this);
+        hint.setText("这些名字只显示在手机上，用于区分 Mac 上保存的第几个密码。"
+                + "密码本身不会保存到手机。");
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        hint.setTextColor(COL_MUTED);
+        hint.setPadding(0, 0, 0, dp(10));
+        box.addView(hint);
+
+        final EditText[] inputs = new EditText[slots];
+        for (int i = 0; i < slots; i++) {
+            TextView l = new TextView(this);
+            l.setText("Mac 上第 " + (i + 1) + " 个密码，叫：");
+            l.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            l.setTextColor(COL_MUTED);
+            l.setPadding(0, dp(8), 0, 0);
+            box.addView(l);
+
+            EditText e = new EditText(this);
+            e.setSingleLine(true);
+            e.setHint("例如：当前密码 / 旧密码");
+            e.setText(active.labelFor(i).startsWith("密码 ") ? "" : active.labelFor(i));
+            box.addView(e);
+            inputs[i] = e;
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("给密码位起名")
+                .setView(box)
+                .setPositiveButton("保存", (dialog, which) -> {
+                    List<String> names = new ArrayList<>();
+                    for (EditText e : inputs) names.add(e.getText().toString().trim());
+                    store.setPasswordPreference(active.id, active.preferredPassword, names);
+                    renderState();
+                    Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
     private void showMacPicker() {
         final List<MacEntryStore.Entry> list = store.all();
         if (list.isEmpty()) {
@@ -518,6 +615,8 @@ public class MainActivity extends Activity {
             unlockButton.setEnabled(false);
             unlockButton.setBackgroundColor(COL_GREY);
             connectButton.setText("重新连接");
+            fillPasswordButton.setText("填充密码");
+            fillPasswordButton.setEnabled(false);
             return;
         }
 
@@ -525,6 +624,9 @@ public class MainActivity extends Activity {
         macNameView.setText("当前：" + active.displayName()
                 + (pos.isEmpty() ? "" : "   (" + pos + ")"));
         macNameView.setTextColor(COL_TEXT);
+
+        // 显示当前用哪个密码位（密码本身不在手机上，这里只是位次与名字）
+        fillPasswordButton.setText("填充密码：" + active.labelFor(active.preferredPassword));
 
         String state = BleService.getState();
         statusView.setText(state);
@@ -541,6 +643,7 @@ public class MainActivity extends Activity {
             unlockButton.setBackgroundColor(COL_GREY);
         }
         unlockButton.setEnabled(true);
+        fillPasswordButton.setEnabled(true);
         connectButton.setText(BleService.STATE_SCANNING.equals(state) ? "搜索中…" : "重新连接");
     }
 

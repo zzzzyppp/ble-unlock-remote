@@ -6,6 +6,7 @@
 #   ./mac-ble-unlock.sh install      安装（编译 + 配置 + 注册开机自启）
 #   ./mac-ble-unlock.sh token        显示配对令牌（在手机 App 里填写）
 #   ./mac-ble-unlock.sh set-password 把登录密码存入钥匙串
+#   ./mac-ble-unlock.sh passwords list    查看已保存的多个密码
 #   ./mac-ble-unlock.sh accessibility 申请「辅助功能」权限
 #   ./mac-ble-unlock.sh start        启动服务
 #   ./mac-ble-unlock.sh stop         停止服务
@@ -426,6 +427,24 @@ grant_accessibility() {
     fi
 }
 
+# 该版本的服务端是否支持 --passwords 子命令。
+# 不支持时直接调用会被当成启动参数而**常驻运行**，留下孤儿进程。
+service_supports_passwords() {
+    local caps="$APP_BUNDLE/Contents/Resources/capabilities"
+    [ -f "$caps" ] && grep -q 'passwords' "$caps" 2>/dev/null
+}
+
+cmd_passwords() {
+    [ -x "$APP_BIN" ] || die "尚未安装，请先运行：$0 install"
+    if ! service_supports_passwords; then
+        warn "当前服务端版本不支持多密码管理。"
+        echo "  请重新运行安装包（或 $0 install）升级后再试。"
+        exit 1
+    fi
+    shift   # 去掉 "passwords"
+    "$APP_BIN" --passwords "$@"
+}
+
 cmd_set_password() {
     [ -f "$CONFIG_FILE" ] || die "尚未安装，请先运行：$0 install"
     store_password
@@ -534,6 +553,7 @@ case "${1:-}" in
     install)       cmd_install ;;
     token)         cmd_token ;;
     set-password)  cmd_set_password ;;
+    passwords)     cmd_passwords "$@" ;;
     accessibility) grant_accessibility ;;
     start)         cmd_start ;;
     stop)          cmd_stop ;;

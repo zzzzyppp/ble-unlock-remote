@@ -19,7 +19,8 @@ import javax.crypto.spec.SecretKeySpec;
  *   3     1     指令：0x01 解锁 / 0x02 锁定 / 0x03 ping
  *   4     8     时间戳，大端 UInt64（秒）
  *   12    16    nonce，随机字节
- *   28    2     保留（0x0000）
+ *   28    1     密码序号（0 基）。仅 CMD_UNLOCK_FROM 使用
+ *   29    1     保留（0x00）
  *   30    32    HMAC-SHA256(前 30 字节)
  *
  * 注意：HMAC 覆盖前 30 字节（0..29），因此消息缓冲区固定为 30 字节。
@@ -38,6 +39,8 @@ public final class Protocol {
     public static final byte CMD_UNLOCK = 0x01;
     public static final byte CMD_LOCK = 0x02;
     public static final byte CMD_PING = 0x03;
+    /** 指定用第几个密码解锁 */
+    public static final byte CMD_UNLOCK_FROM = 0x04;
 
     public static final int MESSAGE_LEN = 30;
     public static final int HMAC_LEN = 32;
@@ -50,8 +53,24 @@ public final class Protocol {
 
     /** 生成一条带签名的完整指令包。key 为 32 字节预共享密钥。 */
     public static byte[] buildPacket(byte command, byte[] key) throws Exception {
+        return buildPacket(command, key, -1);
+    }
+
+    /**
+     * 生成指令包。
+     *
+     * @param passwordIndex 优先使用的密码序号（0 基）；负数表示不指定，
+     *                      按 Mac 上保存的顺序尝试。
+     */
+    public static byte[] buildPacket(byte command, byte[] key, int passwordIndex)
+            throws Exception {
         if (key == null || key.length != 32) {
             throw new IllegalArgumentException("配对密钥必须是 32 字节");
+        }
+        // 指定密码时改用带序号的指令码；未指定则用原来的指令码，
+        // 这样旧版 Mac 服务端仍能正常工作。
+        if (command == CMD_UNLOCK && passwordIndex >= 0 && passwordIndex <= 255) {
+            command = CMD_UNLOCK_FROM;
         }
 
         byte[] message = new byte[MESSAGE_LEN];
@@ -69,7 +88,11 @@ public final class Protocol {
         RANDOM.nextBytes(nonce);
         System.arraycopy(nonce, 0, message, 12, 16);
 
-        // 偏移 28..29 为保留字节，保持 0
+        // 偏移 28：密码序号；29 保留
+        if (command == CMD_UNLOCK_FROM && passwordIndex >= 0) {
+            message[28] = (byte) passwordIndex;
+            message[29] = 0;
+        }
 
         byte[] tag = hmacSha256(key, message);
         byte[] packet = new byte[PACKET_LEN];

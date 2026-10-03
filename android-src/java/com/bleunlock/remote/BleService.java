@@ -421,6 +421,12 @@ public class BleService extends Service {
             case "ERR_NO_PW":
                 publish(STATE_ERROR, "Mac 钥匙串中没有密码");
                 break;
+            case "ERR_ALL_PW":
+                publish(STATE_ERROR, "Mac 上保存的密码都不对，请检查");
+                break;
+            case "ERR_INDEX":
+                publish(STATE_ERROR, "指定的密码序号 Mac 上不存在");
+                break;
             case "ERR_HMAC":
                 publish(STATE_ERROR, "配对密钥错误");
                 break;
@@ -488,7 +494,13 @@ public class BleService extends Service {
         }
 
         try {
-            byte[] packet = Protocol.buildPacket(command, key);
+            // 解锁时带上"用第几个密码"。手机不保存密码本身，
+            // 只告诉 Mac 优先试哪一个；Mac 上该密码不对时会自动回退试其余。
+            int pwIndex = -1;
+            if (command == Protocol.CMD_UNLOCK && activeEntry != null) {
+                pwIndex = Math.max(0, activeEntry.preferredPassword);
+            }
+            byte[] packet = Protocol.buildPacket(command, key, pwIndex);
             c.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
             c.setValue(packet);
             boolean ok = g.writeCharacteristic(c);

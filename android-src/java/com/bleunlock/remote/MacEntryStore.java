@@ -49,6 +49,18 @@ public class MacEntryStore {
         public String token;
         /** 上次成功连接的设备 MAC，可为空 */
         public String address;
+        /**
+         * 优先使用 Mac 上第几个密码（0 基）。
+         *
+         * 手机端不保存密码本身——密码只存在 Mac 的钥匙串里。
+         * 这里只记录"用第几个"，配合 labels 给用户看的名字。
+         */
+        public int preferredPassword = 0;
+        /**
+         * 各密码位在手机上显示的名字，用于区分。
+         * 例如 ["当前密码", "旧密码"] 对应 Mac 上的第 1、2 个密码。
+         */
+        public List<String> passwordLabels = new ArrayList<>();
 
         public Entry() {
         }
@@ -58,6 +70,22 @@ public class MacEntryStore {
             this.name = name;
             this.token = token;
             this.address = address;
+        }
+
+        /** 某个密码位的显示名；没有自定义时给个中性名字 */
+        public String labelFor(int index) {
+            if (index >= 0 && index < passwordLabels.size()) {
+                String s = passwordLabels.get(index);
+                if (s != null && !s.trim().isEmpty()) return s.trim();
+            }
+            return "密码 " + (index + 1);
+        }
+
+        /** 保证 labels 至少有 count 项 */
+        public void ensureLabels(int count) {
+            while (passwordLabels.size() < count) {
+                passwordLabels.add("");
+            }
         }
 
         /** 解析出 32 字节密钥；无效时返回 null */
@@ -92,6 +120,14 @@ public class MacEntryStore {
                 e.name = o.optString("name");
                 e.token = o.optString("token");
                 e.address = o.optString("address", "");
+                e.preferredPassword = o.optInt("preferredPassword", 0);
+                e.passwordLabels = new ArrayList<>();
+                JSONArray labels = o.optJSONArray("passwordLabels");
+                if (labels != null) {
+                    for (int j = 0; j < labels.length(); j++) {
+                        e.passwordLabels.add(labels.optString(j, ""));
+                    }
+                }
                 if (e.id == null || e.id.isEmpty()) e.id = UUID.randomUUID().toString();
                 if (e.token != null && !e.token.isEmpty()) list.add(e);
             }
@@ -110,6 +146,10 @@ public class MacEntryStore {
                 o.put("name", e.name == null ? "" : e.name);
                 o.put("token", e.token);
                 o.put("address", e.address == null ? "" : e.address);
+                o.put("preferredPassword", e.preferredPassword);
+                JSONArray labels = new JSONArray();
+                for (String l : e.passwordLabels) labels.put(l == null ? "" : l);
+                o.put("passwordLabels", labels);
             } catch (JSONException ignored) {
             }
             array.put(o);
@@ -159,6 +199,19 @@ public class MacEntryStore {
             selected = list.isEmpty() ? null : list.get(0).id;
         }
         save(list, selected);
+    }
+
+    /** 设置某台 Mac 优先使用的密码位与各位的显示名 */
+    public void setPasswordPreference(String id, int preferredIndex, List<String> labels) {
+        List<Entry> list = all();
+        for (Entry e : list) {
+            if (e.id.equals(id)) {
+                e.preferredPassword = Math.max(0, preferredIndex);
+                e.passwordLabels = new ArrayList<>(labels);
+                break;
+            }
+        }
+        save(list, selectedId());
     }
 
     /** 记录某条 Mac 最近的设备地址，便于下次直连 */
