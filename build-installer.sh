@@ -25,7 +25,7 @@ cd "$SCRIPT_DIR"
 
 # ---------------------------------------------------------------- 配置
 
-VERSION="${VERSION:-1.3.0}"
+VERSION="${VERSION:-1.3.1}"
 MIN_MACOS="11.0"
 ARCH="${ARCH:-arm64}"
 

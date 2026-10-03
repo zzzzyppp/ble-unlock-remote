@@ -407,11 +407,36 @@ struct Installer {
         return text.contains("ax-status")
     }
 
-    /// 查询辅助功能权限状态。
+    /// 守护进程状态文件路径（由服务端自己写入）
+    static var daemonStatusFile: URL {
+        Const.supportDir.appendingPathComponent("daemon-status.json")
+    }
+
+    /// 读取守护进程自己报告的辅助功能权限状态。
     ///
-    /// 注意：本函数必须由 App bundle 内的二进制自己回答——「辅助功能」权限是
-    /// 按二进制（TCC 主体）授予的，另编一个程序去查只会得到它自己的权限。
-    func hasAccessibility() -> Bool {
+    /// 为什么不能直接问二进制：TCC 的辅助功能信任**会从父进程继承**。
+    /// 设置向导自身是受信任的（用户在系统设置里勾选了它，或从终端启动而继承了终端），
+    /// 它 fork 出来的子进程也会报告"已授权"——但真正干活的守护进程由 launchd 启动，
+    /// 不受此信任，实际是未授权。这正是"向导说已授权、手机却报缺少权限"的原因。
+    ///
+    /// 因此以守护进程自己落盘的状态为准。
+    func daemonAccessibility() -> Bool? {
+        guard let data = FileManager.default.contents(atPath: Self.daemonStatusFile.path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ax = obj["axTrusted"] as? Bool else {
+            return nil
+        }
+        return ax
+    }
+
+    /// 删除守护进程状态文件，确保随后读到的是本次启动后的新状态
+    func clearDaemonStatus() {
+        try? FileManager.default.removeItem(at: Self.daemonStatusFile)
+    }
+
+    /// 旧接口：子进程视角的判定，仅作为守护进程尚未报告时的兜底参考。
+    /// **不要用它来判断解锁能否成功**。
+    func childProcessAccessibility() -> Bool {
         guard FileManager.default.isExecutableFile(atPath: Const.serviceBin.path) else { return false }
         guard serviceSupportsAxStatus() else {
             log("服务端版本过旧，无法查询权限状态（需重新安装）")
@@ -423,6 +448,37 @@ struct Installer {
             return false
         }
         return r.code == 0
+    }
+
+    /// 让守护进程自己发起「辅助功能」授权请求。
+    ///
+    /// 这比让用户手动在系统设置里添加可靠：手动添加时用户容易选中外层 App 或
+    /// 找错路径，而由守护进程自己调用 AXIsProcessTrustedWithOptions(prompt: true)，
+    /// 系统会把授权记录绑定到正确的主体上。
+    func requestAccessibilityFromDaemon() -> String {
+        guard FileManager.default.isExecutableFile(atPath: Const.serviceBin.path) else {
+            return "服务端未安装"
+        }
+        let r = runFull(Const.serviceBin.path, ["--request-accessibility"])
+        let combined = (r.out + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
+        log("守护进程授权请求：\(r.summary)")
+        return combined
+    }
+
+    /// 请求守护进程刷新权限状态（用户在系统设置里授权后调用）
+    func requestDaemonRefresh() {
+        let path = Const.supportDir.appendingPathComponent("refresh.request")
+        try? "refresh-ax".write(to: path, atomically: true, encoding: .utf8)
+    }
+
+    /// 等待守护进程写出状态文件（服务启动后需要一点时间）
+    func waitForDaemonStatus(timeout: TimeInterval = 12) -> Bool? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let ax = daemonAccessibility() { return ax }
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+        return daemonAccessibility()
     }
 
     func openAccessibilitySettings() {

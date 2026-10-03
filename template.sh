@@ -82,21 +82,37 @@ check_swiftc() {
     fi
 }
 
+# 读取守护进程自己报告的辅助功能权限状态。
+#
+# 关键：不能用 --ax-status 从本脚本去问！
+# TCC 的辅助功能信任**会从父进程继承**：脚本从终端运行时继承了终端的信任，
+# 于是它 fork 出来的子进程一律报告「已授权」，而真正由 launchd 启动的守护进程
+# 其实并未获得授权。这正是「向导说已授权、手机却报缺少权限」的成因。
+#
+# 因此以守护进程自己落盘的状态为准。
+#
+# 返回：0=已授权  1=未授权  2=未知（守护进程尚未报告）
 have_accessibility() {
-    # 关键：必须由 App bundle 里的可执行文件自己报告。
-    # 「辅助功能」权限是按二进制（TCC 主体）授予的，另编一个探测小程序去查，
-    # 拿到的是那个程序自己的权限，会永远是「未授权」。
-    if [ ! -x "$APP_BIN" ]; then
-        return 1   # 还没编译
+    local status="$APP_SUPPORT/daemon-status.json"
+    if [ ! -f "$status" ]; then
+        return 2
     fi
-    # 旧版二进制不认识 --ax-status，直接调用会被当成「启动服务」而挂住。
-    # 用能力标记文件判断（不能用 grep 扫二进制：Swift 会合并参数字符串）。
-    local caps="$APP_BUNDLE/Contents/Resources/capabilities"
-    if [ ! -f "$caps" ] || ! grep -q 'ax-status' "$caps" 2>/dev/null; then
-        return 2   # 二进制过旧，需要重新运行 install
+    # 用 grep 解析，不用 sed：BSD sed 不支持 \| 交替语法（GNU 扩展），
+    # 在 macOS 上会静默匹配失败。
+    if grep -q '"axTrusted"[[:space:]]*:[[:space:]]*true' "$status" 2>/dev/null; then
+        return 0
+    elif grep -q '"axTrusted"[[:space:]]*:[[:space:]]*false' "$status" 2>/dev/null; then
+        return 1
+    else
+        return 2
     fi
-    "$APP_BIN" --ax-status >/dev/null 2>&1
-    return $?
+}
+
+# 让守护进程重新评估并落盘权限状态
+refresh_daemon_status() {
+    mkdir -p "$APP_SUPPORT"
+    printf 'refresh-ax' > "$APP_SUPPORT/refresh.request" 2>/dev/null || true
+    sleep 1
 }
 
 # 程序是否已就绪（用于区分「没装」和「权限没给」）
@@ -365,33 +381,48 @@ cmd_token() {
 grant_accessibility() {
     [ -x "$APP_BIN" ] || die "还没有编译好的程序，请先运行：$0 install"
 
-    if have_accessibility; then
-        ok "已获得「辅助功能」权限"
-        return 0
-    fi
-
-    # 通过 LaunchAgent 启动，让系统把权限请求归属到正确的进程
+    # 确保服务在跑：守护进程启动后才会写出权限状态文件
     write_launch_agent
     stop_service
     start_service
-    "$APP_BIN" --add-accessibility >/dev/null 2>&1 &
-    sleep 1
+    refresh_daemon_status
 
-    warn "需要你在系统设置里手动授权（这是 macOS 的强制要求，脚本无法代劳）："
+    have_accessibility
+    local ax=$?
+    if [ $ax -eq 0 ]; then
+        ok "守护进程已获得「辅助功能」权限"
+        return 0
+    fi
+
+    warn "需要你在系统设置里手动授权（macOS 的强制要求，脚本无法代劳）："
     echo
     echo "    1. 打开「系统设置 → 隐私与安全性 → 辅助功能」"
-    echo "    2. 找到 BLEUnlockCmd 并打开开关（找不到就点左下角 + 添加：）"
+    echo "    2. 把下面这个文件拖进列表，或点 ＋ 选择它："
+    echo
     echo "       ${APP_BIN}"
     echo
+    echo "    注意：要添加的是上面这个路径，而不是「应用程序」里的 BLE Unlock。"
+    echo "          两者是不同的程序；授权给 App 不会让后台服务获得权限。"
+    echo
+    echo "    如果列表里已有一条 BLEUnlockCmd 且开关是打开的却仍无效，"
+    echo "    请先用「−」删除它，再重新添加一次。"
+    echo
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null
+    open -R "$APP_BIN" 2>/dev/null
     printf '%s' "  授权完成后按回车继续…"
     if [ -t 0 ]; then read -r _; else echo; fi
 
-    if have_accessibility; then
-        ok "权限已确认"
+    refresh_daemon_status
+    have_accessibility
+    ax=$?
+    if [ $ax -eq 0 ]; then
+        ok "权限已确认生效"
+    elif [ $ax -eq 2 ]; then
+        warn "守护进程尚未报告状态，请确认服务在运行：$0 restart"
     else
-        warn "检测到权限仍未生效。可以稍后重试：$0 accessibility"
-        warn "（有时需要重启服务：$0 restart）"
+        warn "守护进程仍未获得权限"
+        warn "请确认你添加的是：${APP_BIN}"
+        warn "重试：$0 accessibility"
     fi
 }
 
@@ -428,17 +459,21 @@ cmd_status() {
         fail "程序：未编译（请先运行 $0 install）"
     else
         ok "程序：$APP_BIN"
+        refresh_daemon_status
         have_accessibility
         local ax=$?
         if [ $ax -eq 0 ]; then
-            ok "辅助功能权限：已授权"
+            ok "辅助功能权限：守护进程已授权"
         elif [ $ax -eq 2 ]; then
-            warn "辅助功能权限：无法判定（程序版本过旧）"
-            echo "    请重新运行 $0 install 更新程序后再检查"
+            warn "辅助功能权限：无法判定（守护进程尚未报告）"
+            echo "    请确认服务在运行：$0 restart"
         else
-            fail "辅助功能权限：未授权（解锁不会生效）"
+            fail "辅助功能权限：守护进程未授权（解锁不会生效）"
+            echo "    需要授权的文件是："
+            echo "      $APP_BIN"
+            echo "    （不是「应用程序」里的 BLE Unlock —— 那是设置 App，"
+            echo "      授权给它不会让后台服务获得权限）"
             echo "    修复：$0 accessibility"
-            echo "    注意：授权后需重启服务才生效：$0 restart"
         fi
     fi
     if [ -f "$CONFIG_FILE" ]; then

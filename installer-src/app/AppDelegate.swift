@@ -40,8 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setup.onSecondary = { [weak self] in self?.handleSecondary() }
         setup.present()
 
-        if alreadyInstalled && installer.hasAccessibility() {
-            setup.appendLog("检测到服务端与权限均已就绪")
+        if alreadyInstalled, let daemonAX = installer.daemonAccessibility() {
+            setup.appendLog(daemonAX
+                ? "检测到服务端与辅助功能权限均已就绪"
+                : "检测到服务端已安装，但守护进程缺少「辅助功能」权限")
         }
     }
 
@@ -204,8 +206,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func finishSuccessfully(token: String) {
-        let axOK = installer.hasAccessibility()
-        diag("安装完成，辅助功能权限：\(axOK)")
+        // 关键：先清掉旧的守护进程状态，再启动服务，
+        // 这样随后读到的必然是本次启动的真实权限判定。
+        installer.clearDaemonStatus()
+        installer.startService()
+
+        // 等守护进程自己报告权限状态。不能用向导自己的子进程去问——
+        // TCC 的辅助功能信任会从父进程继承，向导自身受信任时子进程会假报"已授权"。
+        let daemonAX = installer.waitForDaemonStatus(timeout: 12)
+        diag("守护进程权限状态: \(daemonAX.map { $0 ? "已授权" : "未授权" } ?? "未报告")")
 
         var message = """
         服务端已就绪。
@@ -217,18 +226,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         在手机 App 里点「＋ 添加 Mac」，粘贴上面的令牌，然后点「解锁」。
         """
 
-        if axOK {
+        if daemonAX == true {
             didFinishAccessibility = true
-            message += "\n\n「辅助功能」权限已授权，一切就绪。"
+            message += "\n\n「辅助功能」权限已确认，一切就绪。"
             setup.showFinished(success: true, message: message)
         } else {
             didFinishAccessibility = false
-            message += "\n\n还差最后一步：「辅助功能」权限尚未授权。点下方按钮前往授权。"
+            if daemonAX == nil {
+                setup.appendLog("⚠️ 守护进程未报告权限状态，请确认它已启动")
+            }
+            message += """
+
+
+            还差最后一步：「辅助功能」权限尚未授予**真正运行的守护进程**。
+
+            注意：这一项必须授予 BLEUnlockCmd，而不是本设置 App。
+            若系统设置里该项开关已是打开状态，请先删除它再重新添加——
+            旧授权可能绑定到了旧版本的程序。
+            """
             setup.showFinished(success: true, message: message)
             setup.setSecondaryTitle("复制配对令牌")
             setup.setPrimaryTitle("打开系统设置授权")
             setup.onPrimary = { [weak self] _ in self?.startAccessibilityFlow() }
-            // 给用户 3 秒读完令牌，再自动引导
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 self.startAccessibilityFlow()
             }
@@ -238,33 +257,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 辅助功能权限引导
 
     private func startAccessibilityFlow() {
-        if installer.hasAccessibility() {
+        // 先让守护进程刷新一次（也许用户刚刚已经授权了）
+        installer.requestDaemonRefresh()
+        Thread.sleep(forTimeInterval: 0.8)
+        if installer.daemonAccessibility() == true {
             confirmAccessibilityOK()
             return
         }
-        setup.appendLog("")
-        setup.appendLog("→ 打开「系统设置 → 隐私与安全性 → 辅助功能」")
-        setup.appendLog("  在列表中找到 BLEUnlockCmd 并打开开关")
-        setup.appendLog("  若列表中没有，点左下角 ＋ 添加：")
-        setup.appendLog("  \(Const.serviceBin.path)")
-        installer.openAccessibilitySettings()
 
-        // 轮询等待用户完成授权，最多 3 分钟
+        if setup.stage != .finished || !didFinishAccessibility {
+            setup.appendLog("")
+            setup.appendLog("→ 打开「系统设置 → 隐私与安全性 → 辅助功能」")
+            setup.appendLog("")
+            setup.appendLog("  请把下面这个文件拖进列表（或点 ＋ 选择它）：")
+            setup.appendLog("  \(Const.serviceBin.path)")
+            setup.appendLog("")
+            setup.appendLog("  ⚠️ 要添加的是上面这个路径，不是「应用程序」里的 BLE Unlock。")
+            setup.appendLog("     两者是不同的程序；授权给 App 不会让后台服务获得权限。")
+            setup.appendLog("")
+            setup.appendLog("  若列表里已有一条 BLEUnlockCmd 且开关是打开的却仍无效，")
+            setup.appendLog("  请先用「−」删除它，再重新添加一次。")
+        }
+        installer.openAccessibilitySettings()
+        // 同时在 Finder 里定位该文件，方便用户直接拖拽
+        NSWorkspace.shared.activateFileViewerSelecting([Const.serviceBin])
+
+        // 轮询：每次让守护进程刷新状态，再读它自己的判定。
+        // 绝不能问本 App 的子进程——那会因继承信任而假报已授权。
         accessibilityPollTimer?.invalidate()
         var waited = 0.0
-        accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) {
+        accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) {
             [weak self] timer in
             guard let self = self else { timer.invalidate(); return }
-            waited += 2.0
-            if self.installer.hasAccessibility() {
+            waited += 2.5
+            self.installer.requestDaemonRefresh()
+            if self.installer.daemonAccessibility() == true {
                 timer.invalidate()
                 self.confirmAccessibilityOK()
-            } else if waited >= 180 {
+            } else if waited >= 240 {
                 timer.invalidate()
-                self.setup.appendLog("✗ 等待超时，权限仍未生效")
-                self.setup.appendLog("  可稍后重新打开本 App，它会再次引导")
-            } else if Int(waited) % 20 == 0 {
-                self.setup.appendLog("  等待授权中…（已等待 \(Int(waited)) 秒）")
+                self.setup.appendLog("✗ 等待超时，守护进程仍未获得权限")
+                self.setup.appendLog("  可重新打开本 App，它会再次引导并复查")
+            } else if Int(waited) % 30 == 0 {
+                self.setup.appendLog("  仍在等待授权…（已等待 \(Int(waited)) 秒）")
+                self.setup.appendLog("  提示：授权对象是 BLEUnlockCmd，不是本设置 App")
             }
         }
     }

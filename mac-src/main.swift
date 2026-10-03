@@ -48,6 +48,15 @@ let kAppSupport: String = {
 let kConfigPath = kAppSupport + "/config.json"
 let kLogPath    = kAppSupport + "/ble-unlock.log"
 let kKeychainService = "ble-unlock-cmd"
+/// 守护进程把自己的 TCC 权限状态写在这里，供设置向导读取。
+///
+/// 为什么不直接问进程：TCC 的 AX 信任会从父进程继承。设置向导从 Finder/终端
+/// 启动时本身是受信任的，它 fork 出来的子进程也会报告「已授权」——
+/// 但真正干活的守护进程由 launchd 启动，不受此信任，实际是未授权。
+/// 因此必须让守护进程自己把判定结果落盘。
+let kStatusPath = kAppSupport + "/daemon-status.json"
+/// 外部请求刷新权限状态的信号文件（设置向导在用户授权后写入）
+let kRefreshRequestPath = kAppSupport + "/refresh.request"
 
 /// 日志文件是否可用（目录不可写时退化为只输出到 stderr）
 let kLogFileWritable: Bool = {
@@ -63,6 +72,28 @@ let logFormatter: DateFormatter = {
     f.dateFormat = "yyyy-MM-dd HH:mm:ss"
     return f
 }()
+
+/// 记录守护进程自身的 TCC 权限状态，供设置向导判断"真正干活的进程"能否输入。
+func writeDaemonStatus() {
+    let trusted = accessibilityGranted()
+    let payload: [String: Any] = [
+        "pid": Int(getpid()),
+        "axTrusted": trusted,
+        "updatedAt": ISO8601DateFormatter().string(from: Date()),
+        "bundlePath": Bundle.main.bundlePath,
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
+        try? data.write(to: URL(fileURLWithPath: kStatusPath))
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                               ofItemAtPath: kStatusPath)
+    }
+    log("守护进程权限自检：AXIsProcessTrusted = \(trusted)")
+    if !trusted {
+        log("  ⚠️ 本进程无法模拟键盘输入，解锁会失败。")
+        log("     请在「系统设置 → 隐私与安全性 → 辅助功能」中勾选 BLEUnlockCmd；")
+        log("     若开关已是打开状态，请先删除该项再重新添加（旧授权可能绑定到旧版本）。")
+    }
+}
 
 func log(_ message: String) {
     let line = "[\(logFormatter.string(from: Date()))] \(message)\n"
@@ -220,6 +251,8 @@ func performUnlock(reply: @escaping (String) -> Void) {
     }
 
     unlockInFlight = true
+    // 刷新权限状态：用户可能刚在系统设置里授权，无需重启服务
+    writeDaemonStatus()
     log("收到解锁指令，开始执行")
 
     wakeDisplay()
@@ -709,6 +742,67 @@ if args.contains("--add-accessibility") {
     exit(0)
 }
 
+// 由守护进程自己发起「辅助功能」授权请求。
+// 用 prompt:true 让系统弹出授权引导并把记录绑定到本二进制。
+if args.contains("--request-accessibility") {
+    let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+    let trusted = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+    if trusted {
+        print("已授权，无需再操作。")
+    } else {
+        print("已弹出系统授权引导。")
+        print("如果系统设置里没有自动出现条目，请在「辅助功能」列表中点 ＋ 添加：")
+        print(CommandLine.arguments[0])
+        print("")
+        print("注意：如果列表里已有 BLEUnlockCmd 且开关是打开的，但对钩无效，")
+        print("请先用「−」删除它，再重新添加一次——旧授权可能绑定了旧版本的程序。")
+    }
+    exit(trusted ? 0 : 1)
+}
+
+// 通知正在运行的守护进程刷新权限状态文件。
+// 用户在「系统设置」里刚勾选完时，需要用这个立刻更新 daemon-status.json，
+// 否则要等到下一次解锁才会刷新。
+if args.contains("--ax-refresh") {
+    let payload: [String: String] = ["action": "refresh-ax"]
+    if let data = try? JSONSerialization.data(withJSONObject: payload) {
+        try? data.write(to: URL(fileURLWithPath: kRefreshRequestPath))
+    }
+    exit(0)
+}
+
+// 完整诊断：把"这个可执行文件自己"看到的权限、钥匙串、锁屏状态全部打印出来。
+// 与 --check 的区别是它同时报告更细的判定依据，便于区分是"权限没给对"
+// 还是"别的环节出问题"。
+if args.contains("--diag") {
+    let bundleID = Bundle.main.bundleIdentifier ?? "(无)"
+    let exe = CommandLine.arguments[0]
+    print("可执行文件 : \(exe)")
+    print("Bundle ID  : \(bundleID)")
+    print("Bundle 路径: \(Bundle.main.bundlePath)")
+    print("")
+    let trusted = accessibilityGranted()
+    print("AXIsProcessTrusted : \(trusted)")
+    print("  → 这一项是 TCC 对本二进制的判定，与「系统设置」里显示的一致")
+    print("")
+    if let config = loadConfig() {
+        print("配置       : 正常（设备名 \(config.deviceName)）")
+        if let pw = fetchPassword(account: config.keychainAccount) {
+            print("钥匙串密码 : 可读取（\(pw.count) 字符）")
+        } else {
+            print("钥匙串密码 : 读取失败")
+        }
+    } else {
+        print("配置       : 缺失")
+    }
+    print("是否锁屏   : \(isScreenLocked() ? "是" : "否")")
+    print("")
+    print("若上面 AXIsProcessTrusted 为 false，但「系统设置 → 辅助功能」里开关是打开的，")
+    print("说明该项授权绑定的是旧版本二进制。请在该列表里删除 BLEUnlockCmd，")
+    print("然后重新运行设置向导添加一次。")
+    exit(trusted ? 0 : 1)
+}
+
 // 供安装脚本查询权限状态。必须由 App bundle 内这个可执行文件自己报告，
 // 因为「辅助功能」权限是按二进制（TCC 主体）授予的：另编一个探测小程序去查，
 // 得到的是那个程序自己的权限，会永远是「未授权」——这正是之前的误报来源。
@@ -731,6 +825,24 @@ if args.contains("--check") {
         print("登录密码: 未找到")
     }
     print("当前是否锁屏: \(isScreenLocked() ? "是" : "否")")
+    print("")
+    print("── 守护进程实际状态（决定解锁能否成功）──")
+    // 注意：本进程从终端启动时可能继承了终端的 AX 信任，因此上面那一项
+    // 未必代表真正干活的守护进程。真实状态以守护进程自己落盘的内容为准。
+    if let data = FileManager.default.contents(atPath: kStatusPath),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        let ax = (obj["axTrusted"] as? Bool) ?? false
+        let pid = obj["pid"] as? Int ?? -1
+        let at = obj["updatedAt"] as? String ?? "?"
+        print("守护进程 AX 权限: \(ax ? "已授权 ✓" : "未授权 ✗")")
+        print("  记录时间: \(at)  PID: \(pid)")
+        if !ax {
+            print("  → 解锁会失败。请在「系统设置 → 隐私与安全性 → 辅助功能」")
+            print("     中勾选 BLEUnlockCmd；若开关已打开，请先删除该项再重新添加。")
+        }
+    } else {
+        print("守护进程 AX 权限: 未知（守护进程尚未写过状态，可能未运行）")
+    }
     exit(0)
 }
 
@@ -814,6 +926,10 @@ if !accessibilityGranted() {
 
 log("启动 BLEUnlockCmd，设备名「\(config.deviceName)」")
 
+// 把本进程（守护进程）自身的权限判定落盘，供设置向导读取。
+// 这一项才是决定"解锁能否成功"的真实状态。
+writeDaemonStatus()
+
 let server = PeripheralServer()
 server.start(key: symmetricKey, deviceName: config.deviceName)
 
@@ -846,5 +962,17 @@ sigintSource.resume()
 let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 sigtermSource.setEventHandler { log("收到 SIGTERM，退出"); cleanup(); exit(0) }
 sigtermSource.resume()
+
+// 监视刷新请求：设置向导在用户完成授权后写入该文件，
+// 守护进程据此立刻刷新 daemon-status.json，无需重启服务。
+let refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: kRefreshRequestPath) else { return }
+    try? fm.removeItem(atPath: kRefreshRequestPath)
+    log("收到权限刷新请求")
+    writeDaemonStatus()
+    log("权限状态已更新，手机端会立即看到最新结果")
+}
+RunLoop.main.add(refreshTimer, forMode: .common)
 
 RunLoop.main.run()
