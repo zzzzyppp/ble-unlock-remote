@@ -25,7 +25,7 @@ cd "$SCRIPT_DIR"
 
 # ---------------------------------------------------------------- 配置
 
-VERSION="${VERSION:-1.3.1}"
+VERSION="${VERSION:-1.4.0}"
 MIN_MACOS="11.0"
 ARCH="${ARCH:-arm64}"
 
@@ -140,6 +140,7 @@ swiftc -O -suppress-warnings \
     -module-cache-path "$SCRIPT_DIR/.cache" \
     -target "${ARCH}-apple-macos${MIN_MACOS}" \
     "$BUILD/BuildInfo.swift" \
+    installer-src/app/Localization.swift \
     installer-src/app/Installer.swift \
     installer-src/app/SetupWindow.swift \
     installer-src/app/PasswordEditor.swift \
@@ -173,6 +174,33 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+info "复制本地化资源"
+for lang in zh-Hans en; do
+    src="$SCRIPT_DIR/installer-src/strings/$lang.lproj"
+    if [ -f "$src/Localizable.strings" ]; then
+        mkdir -p "$APP_RES/$lang.lproj"
+        cp "$src/Localizable.strings" "$APP_RES/$lang.lproj/Localizable.strings"
+        ok "已加入 $lang"
+    else
+        warn "缺少 $lang 的本地化资源"
+    fi
+done
+# 让系统知道支持哪些语言（也便于「系统设置」里按 App 单独指定语言）
+python3 - "$APP/Contents/Info.plist" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+if "CFBundleLocalizations" not in s:
+    s = s.replace(
+        "    <key>NSPrincipalClass</key>",
+        "    <key>CFBundleLocalizations</key>\n"
+        "    <array><string>zh-Hans</string><string>en</string></array>\n"
+        "    <key>CFBundleDevelopmentRegion</key><string>en</string>\n"
+        "    <key>NSPrincipalClass</key>", 1)
+    open(p, "w", encoding="utf-8").write(s)
+PYEOF
+
 
 codesign --force --sign - --identifier "$BUNDLE_ID" "$APP" >/dev/null 2>&1 \
     && ok "App 已签名（adhoc）" || warn "App 签名失败（不影响功能）"

@@ -20,7 +20,7 @@ final class SetupWindow: NSObject {
     private let progress = NSProgressIndicator()
     private let logView = NSTextView()
     private let passwordField = NSSecureTextField()
-    private let passwordLabel = NSTextField(labelWithString: "登录密码：")
+    private let passwordLabel = NSTextField(labelWithString: L("登录密码："))
     private let primaryButton = NSButton()
     private let secondaryButton = NSButton()
     private let manageButton = NSButton()
@@ -46,7 +46,7 @@ final class SetupWindow: NSObject {
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false)
-        window.title = "BLE Unlock 设置"
+        window.title = L("BLE Unlock 设置")
         window.center()
         super.init()
         buildUI()
@@ -90,7 +90,7 @@ final class SetupWindow: NSObject {
         passwordLabel.isHidden = true
 
         passwordField.translatesAutoresizingMaskIntoConstraints = false
-        passwordField.placeholderString = "输入你的 Mac 登录密码"
+        passwordField.placeholderString = L("输入你的 Mac 登录密码")
         passwordField.isHidden = true
         passwordField.target = self
         passwordField.action = #selector(primaryClicked)
@@ -107,7 +107,7 @@ final class SetupWindow: NSObject {
         secondaryButton.translatesAutoresizingMaskIntoConstraints = false
 
         // 管理密码：任何时候都可用，方便用户随时增删多个密码
-        manageButton.title = "管理密码（可添加多个）"
+        manageButton.title = L("管理密码（可添加多个）")
         manageButton.bezelStyle = .rounded
         manageButton.target = self
         manageButton.action = #selector(manageClicked)
@@ -165,39 +165,39 @@ final class SetupWindow: NSObject {
     func showIntro(alreadyInstalled: Bool) {
         stage = .intro
         startedAt = Date()
-        titleLabel.stringValue = alreadyInstalled ? "更新 BLE Unlock" : "欢迎使用 BLE Unlock"
+        titleLabel.stringValue = alreadyInstalled ? L("更新 BLE Unlock") : L("欢迎使用 BLE Unlock")
         descLabel.stringValue = alreadyInstalled
-            ? "检测到已安装。继续操作会更新服务端，并保留你原有的配对密钥。"
-            : "接下来会在这台 Mac 上完成以下配置，全程不需要终端："
-        appendLog(alreadyInstalled ? "检测到已有安装" : "未检测到已有安装")
+            ? L("检测到已安装。继续操作会更新服务端，并保留你原有的配对密钥。")
+            : L("接下来会在这台 Mac 上完成以下配置，全程不需要终端：")
+        appendLog(alreadyInstalled ? L("检测到已有安装") : L("未检测到已有安装"))
         appendLog("")
         appendLog(alreadyInstalled
-            ? "1. 更新服务端程序\n2. 保留原有配对密钥\n3. 重新写入登录密码\n4. 设置开机自启"
-            : "1. 安装服务端程序\n2. 生成你的专属配对密钥\n3. 把你的登录密码存入钥匙串\n4. 设置开机自启")
+            ? L("1. 更新服务端程序\n2. 保留原有配对密钥\n3. 重新写入登录密码\n4. 设置开机自启")
+            : L("1. 安装服务端程序\n2. 生成你的专属配对密钥\n3. 把你的登录密码存入钥匙串\n4. 设置开机自启"))
         progress.doubleValue = 0
         passwordLabel.isHidden = true
         passwordField.isHidden = true
         passwordField.stringValue = ""
-        primaryButton.title = alreadyInstalled ? "开始更新" : "开始设置"
+        primaryButton.title = alreadyInstalled ? L("开始更新") : L("开始设置")
         primaryButton.isEnabled = true
-        secondaryButton.title = "退出"
+        secondaryButton.title = L("退出")
         secondaryButton.isHidden = false
         window.makeFirstResponder(primaryButton)
     }
 
     func showPassword(alreadyInstalled: Bool) {
         stage = .needPassword
-        titleLabel.stringValue = "输入登录密码"
-        descLabel.stringValue = """
+        titleLabel.stringValue = L("输入登录密码")
+        descLabel.stringValue = L("""
         蓝牙解锁需要用你的登录密码来自动解锁屏幕。
         密码只存入 macOS 钥匙串，不写入任何文件，也不通过网络传输。
-        """
+        """)
         appendLog("")
-        appendLog("等待输入登录密码…")
+        appendLog(L("等待输入登录密码…"))
         passwordLabel.isHidden = false
         passwordField.isHidden = false
-        primaryButton.title = "继续"
-        secondaryButton.title = "取消"
+        primaryButton.title = L("继续")
+        secondaryButton.title = L("取消")
         window.makeFirstResponder(passwordField)
     }
 
@@ -206,7 +206,7 @@ final class SetupWindow: NSObject {
         primaryButton.isEnabled = false
         secondaryButton.isHidden = true
         passwordField.isEnabled = false
-        primaryButton.title = "正在设置…"
+        primaryButton.title = L("正在设置…")
     }
 
     func setStep(_ done: Double, total: Double) {
@@ -220,15 +220,15 @@ final class SetupWindow: NSObject {
         secondaryButton.isHidden = false
         progress.doubleValue = progress.maxValue
         if success {
-            titleLabel.stringValue = "设置完成"
+            titleLabel.stringValue = L("设置完成")
             descLabel.stringValue = message
-            primaryButton.title = "完成"
-            secondaryButton.title = "复制配对令牌"
+            primaryButton.title = L("完成")
+            secondaryButton.title = L("复制配对令牌")
         } else {
-            titleLabel.stringValue = "设置未完成"
+            titleLabel.stringValue = L("设置未完成")
             descLabel.stringValue = message
-            primaryButton.title = "关闭"
-            secondaryButton.title = "打开日志"
+            primaryButton.title = L("关闭")
+            secondaryButton.title = L("打开日志")
         }
         window.makeFirstResponder(primaryButton)
     }
@@ -245,7 +245,7 @@ final class SetupWindow: NSObject {
             string: line,
             attributes: [
                 .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: text.hasPrefix("失败") || text.hasPrefix("✗")
+                .foregroundColor: text.hasPrefix(L("失败")) || text.hasPrefix("✗")
                     ? NSColor.systemRed
                     : (text.hasPrefix("✓") ? NSColor.systemGreen : NSColor.labelColor),
             ]))

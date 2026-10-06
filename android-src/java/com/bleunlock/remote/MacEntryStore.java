@@ -33,11 +33,17 @@ public class MacEntryStore {
     private static final String KEY_SELECTED = "selected_entry";
 
     private final SharedPreferences prefs;
+    /** 仅用于取本地化文案（迁移旧数据时的兜底名）。持 ApplicationContext 不会泄漏。 */
+    private final Context appContext;
 
     public MacEntryStore(Context context) {
-        this.prefs = context.getApplicationContext()
-                .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        this.appContext = context.getApplicationContext();
+        this.prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         migrateIfNeeded();
+    }
+
+    private String str(int resId) {
+        return appContext.getString(resId);
     }
 
     // ------------------------------------------------------------ 数据结构
@@ -78,7 +84,8 @@ public class MacEntryStore {
                 String s = passwordLabels.get(index);
                 if (s != null && !s.trim().isEmpty()) return s.trim();
             }
-            return "密码 " + (index + 1);
+            // 由 UI 层补本地化名，存储层不持有文案
+            return "";
         }
 
         /** 保证 labels 至少有 count 项 */
@@ -101,8 +108,8 @@ public class MacEntryStore {
         public String displayName() {
             if (name != null && !name.trim().isEmpty()) return name.trim();
             byte[] key = keyBytes();
-            if (key != null) return "未命名 (" + Protocol.fingerprint(key) + ")";
-            return "未命名";
+            if (key != null) return "Unnamed (" + Protocol.fingerprint(key) + ")";
+            return "Unnamed";
         }
     }
 
@@ -291,7 +298,8 @@ public class MacEntryStore {
         }
 
         String name = prefs.getString(LEGACY_KEY_NAME, null);
-        if (name == null || name.trim().isEmpty()) name = "我的 Mac";
+        // 迁移旧数据时的兜底名。历史数据用中文，保留以免用户看到不一致
+        if (name == null || name.trim().isEmpty()) name = str(R.string.s50);
 
         Entry e = new Entry(UUID.randomUUID().toString(), name, legacyToken.trim(), "");
         List<Entry> list = Collections.singletonList(e);

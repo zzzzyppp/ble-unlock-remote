@@ -56,7 +56,7 @@ struct RunResult {
     var summary: String {
         let e = err.trimmingCharacters(in: .whitespacesAndNewlines)
         if code == 0 { return "ok" }
-        return "退出码 \(code)" + (e.isEmpty ? "" : "：\(e)")
+        return L("退出码 \(code)") + (e.isEmpty ? "" : "：\(e)")
     }
 }
 
@@ -142,7 +142,7 @@ func present(title: String,
 }
 
 func alert(_ title: String, _ message: String, style: NSAlert.Style = .informational) {
-    _ = present(title: title, message: message, buttons: ["好"], style: style)
+    _ = present(title: title, message: message, buttons: [L("好")], style: style)
 }
 
 /// 诊断日志。写入 ~/Library/Logs/BLEUnlockSetup.log。
@@ -162,7 +162,7 @@ func diag(_ message: String) {
 }
 
 func confirm(_ title: String, _ message: String, okTitle: String) -> Bool {
-    present(title: title, message: message, buttons: [okTitle, "退出"])
+    present(title: title, message: message, buttons: [okTitle, L("退出")])
         == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
 }
 
@@ -191,12 +191,12 @@ final class Installer {
         // 安装包内的服务端以完整 app 形式提供（嵌套 bundle），
         // 整体复制过去即可——它自带 Info.plist（含蓝牙用途说明）与能力标记。
         guard let embedded = Bundle.main.url(forResource: "BLEUnlockCmd", withExtension: "app") else {
-            return .failed("安装包内缺少服务端（Resources/BLEUnlockCmd.app）")
+            return .failed(L("安装包内缺少服务端（Resources/BLEUnlockCmd.app）"))
         }
 
         // 已存在则先停服务再替换
         if fm.fileExists(atPath: Const.serviceApp.path) {
-            log("检测到已安装，正在更新…")
+            log(L("检测到已安装，正在更新…"))
             stopService()
             try? fm.removeItem(at: Const.serviceApp)
         }
@@ -209,32 +209,32 @@ final class Installer {
             // 直接复制目录有可能破坏签名，导致辅助功能授权失效。
             let ditto = runFull("/usr/bin/ditto", [embedded.path, Const.serviceApp.path])
             if ditto.code != 0 {
-                return .failed("复制服务端失败：\(ditto.summary)")
+                return .failed(L("复制服务端失败：\(ditto.summary)"))
             }
             try fm.setAttributes([.posixPermissions: 0o755],
                                  ofItemAtPath: Const.serviceBin.path)
         } catch {
-            return .failed("复制服务端失败：\(error.localizedDescription)")
+            return .failed(L("复制服务端失败：\(error.localizedDescription)"))
         }
 
         // 兜底：若包内服务端没有签名（例如手工替换过），补一次
         if runFull("/usr/bin/codesign", ["-v", Const.serviceApp.path]).code != 0 {
-            log("包内服务端未签名，补签一次")
+            log(L("包内服务端未签名，补签一次"))
             _ = run("/usr/bin/codesign",
                     ["--force", "--sign", "-", "--identifier", Const.bundleID,
                      Const.serviceApp.path])
         }
 
         guard fm.isExecutableFile(atPath: Const.serviceBin.path) else {
-            return .failed("服务端可执行文件缺失：\(Const.serviceBin.path)")
+            return .failed(L("服务端可执行文件缺失：\(Const.serviceBin.path)"))
         }
         guard FileManager.default.fileExists(
             atPath: Const.serviceApp.appendingPathComponent("Contents/Info.plist").path) else {
-            return .failed("服务端 Info.plist 缺失，安装包可能不完整")
+            return .failed(L("服务端 Info.plist 缺失，安装包可能不完整"))
         }
 
-        log("服务端已安装（嵌套 app）")
-        return .ok("服务端已安装")
+        log(L("服务端已安装（嵌套 app）"))
+        return .ok(L("服务端已安装"))
     }
 
     // ---- 2. 配对密钥 ----
@@ -242,8 +242,8 @@ final class Installer {
     func ensureKey() -> StepResult {
         let fm = FileManager.default
         if fm.fileExists(atPath: Const.configFile.path) {
-            log("保留原有配对密钥")
-            return .ok("已保留原有配对密钥")
+            log(L("保留原有配对密钥"))
+            return .ok(L("已保留原有配对密钥"))
         }
         var bytes = [UInt8](repeating: 0, count: 32)
         for i in 0..<32 { bytes[i] = UInt8.random(in: 0...255) }
@@ -267,10 +267,10 @@ final class Installer {
             try json.write(to: Const.configFile, atomically: true, encoding: .utf8)
             try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Const.configFile.path)
         } catch {
-            return .failed("写入配置失败：\(error.localizedDescription)")
+            return .failed(L("写入配置失败：\(error.localizedDescription)"))
         }
-        log("已生成配对密钥")
-        return .ok("已生成配对密钥")
+        log(L("已生成配对密钥"))
+        return .ok(L("已生成配对密钥"))
     }
 
     // ---- 3. 开机自启 ----
@@ -297,10 +297,10 @@ final class Installer {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try plist.write(to: Const.launchAgent, atomically: true, encoding: .utf8)
         } catch {
-            return .failed("写入开机自启配置失败：\(error.localizedDescription)")
+            return .failed(L("写入开机自启配置失败：\(error.localizedDescription)"))
         }
-        log("已设置开机自启")
-        return .ok("已设置开机自启")
+        log(L("已设置开机自启"))
+        return .ok(L("已设置开机自启"))
     }
 
     func stopService() {
@@ -327,33 +327,33 @@ final class Installer {
                          "-l", "BLEUnlockCmd",
                          "-w", password])
         if r.code != 0 {
-            log("写入钥匙串失败：\(r.summary)")
-            return .failed("""
+            log(L("写入钥匙串失败：\(r.summary)"))
+            return .failed(L("""
             写入钥匙串失败（\(r.summary)）。
 
             最常见的原因是钥匙串被锁定。请打开「钥匙串访问」解锁后重试。
-            """)
+            """))
         }
 
         // 立刻回读确认。密码写错是「解锁静默失败」的头号原因。
         guard let readBack = verifyPassword() else {
-            return .failed("""
+            return .failed(L("""
             密码写入后无法回读，钥匙串可能处于锁定状态。
             请解锁「钥匙串访问」后重试。
-            """)
+            """))
         }
         if readBack != password {
-            log("警告：回读内容与输入不一致（长度 \(readBack.count) vs \(password.count)）")
-            return .failed("""
+            log(L("警告：回读内容与输入不一致（长度 \(readBack.count) vs \(password.count)）"))
+            return .failed(L("""
             钥匙串回读的内容与输入不一致：
               输入长度 \(password.count)，回读长度 \(readBack.count)
 
             请重新运行本 App 再试一次。
-            """)
+            """))
         }
 
-        log("登录密码已存入钥匙串（长度 \(readBack.count)，已回读确认）")
-        return .ok("密码已保存并验证")
+        log(L("登录密码已存入钥匙串（长度 \(readBack.count)，已回读确认）"))
+        return .ok(L("密码已保存并验证"))
     }
 
     func hasPassword() -> Bool {
@@ -373,14 +373,14 @@ final class Installer {
     func loadPasswords() -> [String] {
         let r = runFull(Const.serviceBin.path, ["--passwords", "list", "--values"])
         guard r.code == 0 else {
-            lastPasswordError = "读取密码失败：\(r.summary)"
+            lastPasswordError = L("读取密码失败：\(r.summary)")
             log(lastPasswordError)
             return []
         }
         let text = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = text.data(using: .utf8),
               let arr = try? JSONSerialization.jsonObject(with: data) as? [String] else {
-            lastPasswordError = "密码数据格式异常"
+            lastPasswordError = L("密码数据格式异常")
             log("\(lastPasswordError)：\(text.prefix(80))")
             return []
         }
@@ -394,28 +394,28 @@ final class Installer {
         let clean = passwords.filter { !$0.isEmpty }
             .map { $0.precomposedStringWithCanonicalMapping }
         guard !clean.isEmpty else {
-            lastPasswordError = "至少要保留一个密码，否则解锁会失败。"
+            lastPasswordError = L("至少要保留一个密码，否则解锁会失败。")
             return false
         }
         // 输入是按行传输的，含换行的密码会被拆开，因此明确拒绝
         if let bad = clean.first(where: { $0.contains("\n") || $0.contains("\r") }) {
-            lastPasswordError = """
+            lastPasswordError = L("""
             密码不能包含换行符。
 
             其中有 \(bad.count) 个字符的密码含换行，请重新输入。
-            """
-            log("拒绝保存：密码含换行符")
+            """)
+            log(L("拒绝保存：密码含换行符"))
             return false
         }
         // 每个密码一行，末尾空行表示结束（与服务端约定）
         let payload = clean.joined(separator: "\n") + "\n\n"
         let r = runFull(Const.serviceBin.path, ["--passwords", "set", "--json"], input: payload)
         guard r.code == 0, r.out.contains("\"ok\":true") else {
-            lastPasswordError = "写入钥匙串失败：\(r.summary)"
+            lastPasswordError = L("写入钥匙串失败：\(r.summary)")
             log(lastPasswordError)
             return false
         }
-        log("已保存 \(clean.count) 个密码")
+        log(L("已保存 \(clean.count) 个密码"))
         return true
     }
 
@@ -427,12 +427,12 @@ final class Installer {
                     ["find-generic-password", "-a", NSUserName(),
                      "-s", Const.keychainService, "-w"])
         guard r.code == 0 else {
-            log("回读密码失败（退出码 \(r.code)）")
+            log(L("回读密码失败（退出码 \(r.code)）"))
             return nil
         }
         var pw = r.out
         while pw.hasSuffix("\n") || pw.hasSuffix("\r") { pw.removeLast() }
-        log("已回读钥匙串密码，长度 \(pw.count)")
+        log(L("已回读钥匙串密码，长度 \(pw.count)"))
         return pw.isEmpty ? nil : pw
     }
 
@@ -458,8 +458,8 @@ final class Installer {
     ///
     /// 为什么不能直接问二进制：TCC 的辅助功能信任**会从父进程继承**。
     /// 设置向导自身是受信任的（用户在系统设置里勾选了它，或从终端启动而继承了终端），
-    /// 它 fork 出来的子进程也会报告"已授权"——但真正干活的守护进程由 launchd 启动，
-    /// 不受此信任，实际是未授权。这正是"向导说已授权、手机却报缺少权限"的原因。
+    /// 它 fork 出来的子进程也会报告L("已授权")——但真正干活的守护进程由 launchd 启动，
+    /// 不受此信任，实际是未授权。这正是L("向导说已授权、手机却报缺少权限")的原因。
     ///
     /// 因此以守护进程自己落盘的状态为准。
     func daemonAccessibility() -> Bool? {
@@ -481,12 +481,12 @@ final class Installer {
     func childProcessAccessibility() -> Bool {
         guard FileManager.default.isExecutableFile(atPath: Const.serviceBin.path) else { return false }
         guard serviceSupportsAxStatus() else {
-            log("服务端版本过旧，无法查询权限状态（需重新安装）")
+            log(L("服务端版本过旧，无法查询权限状态（需重新安装）"))
             return false
         }
         let r = runFull(Const.serviceBin.path, ["--ax-status"])
         guard r.code == 0 || r.code == 1 else {
-            log("权限查询异常：\(r.summary)")
+            log(L("权限查询异常：\(r.summary)"))
             return false
         }
         return r.code == 0
@@ -499,11 +499,11 @@ final class Installer {
     /// 系统会把授权记录绑定到正确的主体上。
     func requestAccessibilityFromDaemon() -> String {
         guard FileManager.default.isExecutableFile(atPath: Const.serviceBin.path) else {
-            return "服务端未安装"
+            return L("服务端未安装")
         }
         let r = runFull(Const.serviceBin.path, ["--request-accessibility"])
         let combined = (r.out + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
-        log("守护进程授权请求：\(r.summary)")
+        log(L("守护进程授权请求：\(r.summary)"))
         return combined
     }
 

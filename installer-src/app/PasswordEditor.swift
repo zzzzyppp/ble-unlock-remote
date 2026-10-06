@@ -29,7 +29,7 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false)
-        window.title = "管理登录密码"
+        window.title = L("管理登录密码")
         window.center()
         super.init()
         passwords = installer.loadPasswords()
@@ -41,13 +41,13 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
     private func buildUI() {
         guard let content = window.contentView else { return }
 
-        let title = NSTextField(labelWithString: "登录密码（按顺序尝试）")
+        let title = NSTextField(labelWithString: L("登录密码（按顺序尝试）"))
         title.font = NSFont.boldSystemFont(ofSize: 15)
         title.translatesAutoresizingMaskIntoConstraints = false
 
         let hint = NSTextField(wrappingLabelWithString:
-            "解锁时会从上到下逐个尝试，直到屏幕解开。"
-            + "如果刚改过密码，可以把新旧密码都留在列表里，避免某天忘记更新。")
+            L("解锁时会从上到下逐个尝试，直到屏幕解开。")
+            + L("如果刚改过密码，可以把新旧密码都留在列表里，避免某天忘记更新。"))
         hint.font = NSFont.systemFont(ofSize: 12)
         hint.textColor = .secondaryLabelColor
         hint.translatesAutoresizingMaskIntoConstraints = false
@@ -57,10 +57,10 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
         colIndex.title = "#"
         colIndex.width = 34
         let colMask = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("mask"))
-        colMask.title = "密码"
+        colMask.title = L("密码")
         colMask.width = 300
         let colLen = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("len"))
-        colLen.title = "长度"
+        colLen.title = L("长度")
         colLen.width = 60
         table.addTableColumn(colIndex)
         table.addTableColumn(colMask)
@@ -76,20 +76,20 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
         // 输入
-        let addLabel = NSTextField(labelWithString: "新增：")
+        let addLabel = NSTextField(labelWithString: L("新增："))
         addLabel.translatesAutoresizingMaskIntoConstraints = false
-        inputField.placeholderString = "输入一个登录密码后点「添加」"
+        inputField.placeholderString = L("输入一个登录密码后点「添加」")
         inputField.translatesAutoresizingMaskIntoConstraints = false
         inputField.target = self
         inputField.action = #selector(addPassword)
 
-        addButton.title = "添加"
+        addButton.title = L("添加")
         addButton.bezelStyle = .rounded
         addButton.target = self
         addButton.action = #selector(addPassword)
         addButton.translatesAutoresizingMaskIntoConstraints = false
 
-        removeButton.title = "删除选中"
+        removeButton.title = L("删除选中")
         removeButton.bezelStyle = .rounded
         removeButton.target = self
         removeButton.action = #selector(removeSelected)
@@ -99,14 +99,14 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        saveButton.title = "保存到钥匙串"
+        saveButton.title = L("保存到钥匙串")
         saveButton.bezelStyle = .rounded
         saveButton.keyEquivalent = "\r"
         saveButton.target = self
         saveButton.action = #selector(save)
         saveButton.translatesAutoresizingMaskIntoConstraints = false
 
-        closeButton.title = "关闭"
+        closeButton.title = L("关闭")
         closeButton.bezelStyle = .rounded
         closeButton.target = self
         closeButton.action = #selector(closeWindow)
@@ -200,8 +200,8 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
         table.reloadData()
         removeButton.isEnabled = table.selectedRow >= 0 && !passwords.isEmpty
         statusLabel.stringValue = passwords.isEmpty
-            ? "尚未添加任何密码"
-            : "共 \(passwords.count) 个密码"
+            ? L("尚未添加任何密码")
+            : L("共 \(passwords.count) 个密码")
         if !passwords.isEmpty && table.selectedRow < 0 {
             table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         }
@@ -216,15 +216,15 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
     @objc private func addPassword() {
         let value = inputField.stringValue
         guard !value.isEmpty else {
-            statusLabel.stringValue = "密码不能为空"
+            statusLabel.stringValue = L("密码不能为空")
             return
         }
         guard !value.contains("\n") && !value.contains("\r") else {
-            statusLabel.stringValue = "密码不能包含换行符"
+            statusLabel.stringValue = L("密码不能包含换行符")
             return
         }
         if passwords.contains(value) {
-            statusLabel.stringValue = "这个密码已经在列表里了"
+            statusLabel.stringValue = L("这个密码已经在列表里了")
             inputField.stringValue = ""
             return
         }
@@ -234,7 +234,7 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
         table.selectRowIndexes(IndexSet(integer: passwords.count - 1),
                                byExtendingSelection: false)
         table.scrollRowToVisible(passwords.count - 1)
-        statusLabel.stringValue = "已添加（尚未保存）"
+        statusLabel.stringValue = L("已添加（尚未保存）")
         window.makeFirstResponder(inputField)
     }
 
@@ -243,28 +243,28 @@ final class PasswordEditor: NSObject, NSTableViewDataSource, NSTableViewDelegate
         guard row >= 0 && row < passwords.count else { return }
         passwords.remove(at: row)
         refresh()
-        statusLabel.stringValue = "已删除（尚未保存）"
+        statusLabel.stringValue = L("已删除（尚未保存）")
     }
 
     @objc private func save() {
         if passwords.isEmpty {
             let alert = NSAlert()
-            alert.messageText = "没有密码"
-            alert.informativeText = "至少要保留一个密码，否则解锁会失败。"
-            alert.addButton(withTitle: "好")
+            alert.messageText = L("没有密码")
+            alert.informativeText = L("至少要保留一个密码，否则解锁会失败。")
+            alert.addButton(withTitle: L("好"))
             alert.runModal()
             return
         }
         if installer.savePasswords(passwords) {
-            statusLabel.stringValue = "已保存 \(passwords.count) 个密码到钥匙串 ✓"
+            statusLabel.stringValue = L("已保存 \(passwords.count) 个密码到钥匙串 ✓")
             // 通知后台服务刷新（它会重新读钥匙串）
             installer.requestDaemonRefresh()
         } else {
             let alert = NSAlert()
-            alert.messageText = "保存失败"
+            alert.messageText = L("保存失败")
             alert.informativeText = installer.lastPasswordError
             alert.alertStyle = .critical
-            alert.addButton(withTitle: "好")
+            alert.addButton(withTitle: L("好"))
             alert.runModal()
         }
     }

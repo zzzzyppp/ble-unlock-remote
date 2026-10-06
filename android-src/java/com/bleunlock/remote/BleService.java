@@ -56,22 +56,25 @@ public class BleService extends Service {
     /** 当前正在连接/已连接的 Mac 备注名，供界面显示 */
     public static final String EXTRA_MAC_NAME = "mac_name";
 
-    public static final String STATE_SCANNING = "扫描中";
-    public static final String STATE_CONNECTING = "连接中";
-    public static final String STATE_CONNECTED = "已连接";
-    public static final String STATE_DISCONNECTED = "未连接";
-    public static final String STATE_SENT = "指令已发送";
-    public static final String STATE_ERROR = "出错";
+    // 状态用资源 id 表示，而不是在静态初始化时取字符串——
+    // 静态上下文里拿不到 getString()，而且界面需要按当前语言实时显示。
+    public static final int STATE_SCANNING = R.string.s52;
+    public static final int STATE_CONNECTING = R.string.s91;
+    public static final int STATE_CONNECTED = R.string.s47;
+    public static final int STATE_DISCONNECTED = R.string.s65;
+    public static final int STATE_SENT = R.string.s55;
+    public static final int STATE_ERROR = R.string.s23;
 
     private static final int NOTIFICATION_ID = 1001;
     private static final String CHANNEL_ID = "ble_unlock_status";
     private static final long RECONNECT_DELAY_MS = 3000L;
 
     // 当前连接状态，供界面读取
-    private static volatile String currentState = STATE_DISCONNECTED;
+    private static volatile int currentState = STATE_DISCONNECTED;
     private static volatile String currentDetail = "";
 
-    public static String getState() {
+    /** 当前状态对应的字符串资源 id，由界面自行按语言解析 */
+    public static int getStateRes() {
         return currentState;
     }
 
@@ -109,7 +112,7 @@ public class BleService extends Service {
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
-        startForeground(NOTIFICATION_ID, buildNotification(STATE_DISCONNECTED));
+        startForeground(NOTIFICATION_ID, buildNotification(getString(STATE_DISCONNECTED)));
 
         BluetoothManager manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         adapter = manager != null ? manager.getAdapter() : null;
@@ -133,13 +136,13 @@ public class BleService extends Service {
                     // 切换目标 Mac：断开当前连接后重新开始
                     reloadActiveMac();
                     if (activeEntry == null) {
-                        publish(STATE_ERROR, "尚未配置任何 Mac");
+                        publish(STATE_ERROR, getString(R.string.s39));
                         break;
                     }
                     wantConnection = true;
                     stopScan();
                     closeGatt();
-                    publish(STATE_SCANNING, "已切换到 " + activeEntry.displayName() + "，正在连接…");
+                    publish(STATE_SCANNING, getString(R.string.s42) + activeEntry.displayName() + getString(R.string.s102));
                     handler.postDelayed(this::startScan, 500);
                     break;
                 case ACTION_STOP:
@@ -243,20 +246,20 @@ public class BleService extends Service {
         @Override
         public void onScanFailed(int errorCode) {
             Log.w(TAG, "扫描失败 code=" + errorCode);
-            publish(STATE_ERROR, "扫描失败，错误码 " + errorCode);
+            publish(STATE_ERROR, getString(R.string.s53) + errorCode);
         }
     };
 
     private void startScan() {
         if (adapter == null || !adapter.isEnabled()) {
-            publish(STATE_ERROR, "蓝牙未开启");
+            publish(STATE_ERROR, getString(R.string.s81));
             return;
         }
         if (scanning) return;
         if (gatt != null) return; // 已有连接，无需扫描
 
         if (activeEntry == null) {
-            publish(STATE_ERROR, "尚未配置任何 Mac，请先添加");
+            publish(STATE_ERROR, getString(R.string.s40));
             return;
         }
 
@@ -264,7 +267,7 @@ public class BleService extends Service {
         if (activeEntry.address != null && !activeEntry.address.isEmpty()) {
             try {
                 BluetoothDevice known = adapter.getRemoteDevice(activeEntry.address);
-                publish(STATE_CONNECTING, "正在连接 " + activeEntry.displayName() + "…");
+                publish(STATE_CONNECTING, getString(R.string.s67) + activeEntry.displayName() + "…");
                 connectTo(known);
                 return;
             } catch (IllegalArgumentException e) {
@@ -275,7 +278,7 @@ public class BleService extends Service {
 
         scanner = adapter.getBluetoothLeScanner();
         if (scanner == null) {
-            publish(STATE_ERROR, "无法获取蓝牙扫描器");
+            publish(STATE_ERROR, getString(R.string.s61));
             return;
         }
         try {
@@ -284,9 +287,9 @@ public class BleService extends Service {
                     .build();
             scanner.startScan(null, settings, scanCallback);
             scanning = true;
-            publish(STATE_SCANNING, "正在搜索 " + activeEntry.displayName() + "…");
+            publish(STATE_SCANNING, getString(R.string.s66) + activeEntry.displayName() + "…");
         } catch (SecurityException e) {
-            publish(STATE_ERROR, "缺少蓝牙扫描权限");
+            publish(STATE_ERROR, getString(R.string.s79));
         }
     }
 
@@ -306,18 +309,18 @@ public class BleService extends Service {
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.i(TAG, "已连接，开始发现服务");
-                publish(STATE_CONNECTING, "已连接，正在发现服务…");
+                publish(STATE_CONNECTING, getString(R.string.s48));
                 try {
                     g.discoverServices();
                 } catch (SecurityException e) {
-                    publish(STATE_ERROR, "缺少蓝牙连接权限");
+                    publish(STATE_ERROR, getString(R.string.s80));
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i(TAG, "连接断开 status=" + status);
                 commandChar = null;
                 statusChar = null;
                 closeGatt();
-                publish(STATE_DISCONNECTED, "连接已断开");
+                publish(STATE_DISCONNECTED, getString(R.string.s92));
                 scheduleReconnect();
             }
         }
@@ -326,7 +329,7 @@ public class BleService extends Service {
         public void onServicesDiscovered(BluetoothGatt g, int status) {
             BluetoothGattService service = g.getService(Protocol.SERVICE_UUID);
             if (service == null) {
-                publish(STATE_ERROR, "未找到目标服务，请确认 Mac 端已启动");
+                publish(STATE_ERROR, getString(R.string.s64));
                 closeGatt();
                 scheduleReconnect();
                 return;
@@ -334,7 +337,7 @@ public class BleService extends Service {
             commandChar = service.getCharacteristic(Protocol.CHAR_COMMAND_UUID);
             statusChar = service.getCharacteristic(Protocol.CHAR_STATUS_UUID);
             if (commandChar == null) {
-                publish(STATE_ERROR, "未找到指令特征");
+                publish(STATE_ERROR, getString(R.string.s63));
                 closeGatt();
                 scheduleReconnect();
                 return;
@@ -362,7 +365,7 @@ public class BleService extends Service {
                 }
             }
 
-            publish(STATE_CONNECTED, "已就绪，可以解锁");
+            publish(STATE_CONNECTED, getString(R.string.s45));
         }
 
         @Override
@@ -382,9 +385,9 @@ public class BleService extends Service {
         @Override
         public void onCharacteristicWrite(BluetoothGatt g, BluetoothGattCharacteristic c, int status) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                publish(STATE_SENT, "指令已送达 Mac");
+                publish(STATE_SENT, getString(R.string.s56));
             } else {
-                publish(STATE_ERROR, "写入失败，状态码 " + status);
+                publish(STATE_ERROR, getString(R.string.s21) + status);
             }
         }
     };
@@ -395,46 +398,46 @@ public class BleService extends Service {
         Log.i(TAG, "Mac 状态: " + text);
         switch (text) {
             case "OK":
-                publish(STATE_CONNECTED, "✅ Mac 已解锁");
+                publish(STATE_CONNECTED, getString(R.string.s14));
                 break;
             case "UNLOCKING":
-                publish(STATE_CONNECTED, "Mac 正在解锁…");
+                publish(STATE_CONNECTED, getString(R.string.s10));
                 break;
             case "LOCKING":
-                publish(STATE_CONNECTED, "Mac 正在锁定…");
+                publish(STATE_CONNECTED, getString(R.string.s11));
                 break;
             case "PONG":
-                publish(STATE_CONNECTED, "连接正常 (PONG)");
+                publish(STATE_CONNECTED, getString(R.string.s93));
                 break;
             case "READY":
             case "CONNECTED":
                 break;
             case "BUSY":
-                publish(STATE_ERROR, "Mac 正在处理上一条指令");
+                publish(STATE_ERROR, getString(R.string.s9));
                 break;
             case "NOT_LOCKED":
-                publish(STATE_ERROR, "Mac 屏幕当前未锁定");
+                publish(STATE_ERROR, getString(R.string.s8));
                 break;
             case "ERR_NO_AX":
-                publish(STATE_ERROR, "Mac 缺少「辅助功能」权限");
+                publish(STATE_ERROR, getString(R.string.s12));
                 break;
             case "ERR_NO_PW":
-                publish(STATE_ERROR, "Mac 钥匙串中没有密码");
+                publish(STATE_ERROR, getString(R.string.s13));
                 break;
             case "ERR_ALL_PW":
-                publish(STATE_ERROR, "Mac 上保存的密码都不对，请检查");
+                publish(STATE_ERROR, getString(R.string.s6));
                 break;
             case "ERR_INDEX":
-                publish(STATE_ERROR, "指定的密码序号 Mac 上不存在");
+                publish(STATE_ERROR, getString(R.string.s58));
                 break;
             case "ERR_HMAC":
-                publish(STATE_ERROR, "配对密钥错误");
+                publish(STATE_ERROR, getString(R.string.s97));
                 break;
             case "ERR_REPLAY":
-                publish(STATE_ERROR, "指令被拒绝（重放）");
+                publish(STATE_ERROR, getString(R.string.s57));
                 break;
             case "ERR_TIME":
-                publish(STATE_ERROR, "手机与 Mac 时间相差过大，请校准时间");
+                publish(STATE_ERROR, getString(R.string.s51));
                 break;
             default:
                 publish(STATE_CONNECTED, "Mac: " + text);
@@ -444,7 +447,7 @@ public class BleService extends Service {
 
     private void connectTo(BluetoothDevice device) {
         closeGatt();
-        publish(STATE_CONNECTING, "正在连接 " + device.getAddress());
+        publish(STATE_CONNECTING, getString(R.string.s67) + device.getAddress());
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 gatt = device.connectGatt(this, false, gattCallback,
@@ -453,7 +456,7 @@ public class BleService extends Service {
                 gatt = device.connectGatt(this, false, gattCallback);
             }
         } catch (SecurityException e) {
-            publish(STATE_ERROR, "缺少蓝牙连接权限");
+            publish(STATE_ERROR, getString(R.string.s80));
         }
     }
 
@@ -490,18 +493,18 @@ public class BleService extends Service {
      */
     public String sendCommand(byte command, boolean skipLockCheck) {
         if (activeEntry == null) {
-            publish(STATE_ERROR, "尚未配置任何 Mac，请先添加");
-            return "尚未配置任何 Mac";
+            publish(STATE_ERROR, getString(R.string.s40));
+            return getString(R.string.s39);
         }
         if (!hasKey()) {
-            publish(STATE_ERROR, activeEntry.displayName() + " 的令牌无效");
-            return "令牌无效，请重新填写";
+            publish(STATE_ERROR, activeEntry.displayName() + getString(R.string.s4));
+            return getString(R.string.s16);
         }
         BluetoothGatt g = gatt;
         BluetoothGattCharacteristic c = commandChar;
         if (g == null || c == null) {
-            publish(STATE_ERROR, "尚未连接到 Mac");
-            return "尚未连接到 Mac";
+            publish(STATE_ERROR, getString(R.string.s37));
+            return getString(R.string.s37);
         }
 
         try {
@@ -516,26 +519,26 @@ public class BleService extends Service {
             c.setValue(packet);
             boolean ok = g.writeCharacteristic(c);
             if (!ok) {
-                publish(STATE_ERROR, "写入请求被系统拒绝");
-                return "写入请求被系统拒绝";
+                publish(STATE_ERROR, getString(R.string.s22));
+                return getString(R.string.s22);
             }
-            publish(STATE_SENT, skipLockCheck ? "填充指令已发出" : "指令已发出");
+            publish(STATE_SENT, skipLockCheck ? getString(R.string.s33) : getString(R.string.s54));
             return null;
         } catch (Exception e) {
             Log.e(TAG, "发送失败", e);
-            publish(STATE_ERROR, "发送失败: " + e.getMessage());
-            return "发送失败: " + e.getMessage();
+            publish(STATE_ERROR, getString(R.string.s27) + e.getMessage());
+            return getString(R.string.s27) + e.getMessage();
         }
     }
 
-    private void publish(String state, String detail) {
-        currentState = state;
+    private void publish(int stateRes, String detail) {
+        currentState = stateRes;
         currentDetail = detail;
-        updateNotification(state);
+        updateNotification(getString(stateRes));
 
         Intent intent = new Intent(BROADCAST_STATE);
         intent.setPackage(getPackageName());
-        intent.putExtra(EXTRA_STATE, state);
+        intent.putExtra(EXTRA_STATE, stateRes);
         intent.putExtra(EXTRA_DETAIL, detail);
         intent.putExtra(EXTRA_MAC_NAME, getActiveMacName());
         sendBroadcast(intent);
@@ -570,12 +573,12 @@ public class BleService extends Service {
                 : new Notification.Builder(this);
 
         return builder
-                .setContentTitle("BLE Unlock")
+                .setContentTitle(getString(R.string.app_name))
                 .setContentText(state)
                 .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
                 .setContentIntent(pending)
                 .setOngoing(true)
-                .addAction(new Notification.Action.Builder(null, "解锁 Mac", unlockPending).build())
+                .addAction(new Notification.Action.Builder(null, getString(R.string.s83), unlockPending).build())
                 .build();
     }
 

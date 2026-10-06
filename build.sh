@@ -68,8 +68,8 @@ TARGET_SDK="34"
 
 # 版本号：每次改动功能都应递增 versionCode，否则手机上无法覆盖安装。
 # 可用环境变量临时覆盖：VERSION_CODE=3 VERSION_NAME=1.2.0 ./build.sh
-VERSION_CODE="${VERSION_CODE:-4}"
-VERSION_NAME="${VERSION_NAME:-1.3.0}"
+VERSION_CODE="${VERSION_CODE:-5}"
+VERSION_NAME="${VERSION_NAME:-1.4.0}"
 
 if [ -t 1 ]; then
     C_RESET=$'\033[0m'; C_GREEN=$'\033[32m'; C_RED=$'\033[31m'
@@ -195,13 +195,22 @@ info "编译 Java 源码 (javac)"
 find "$SRC_DIR/java" -name '*.java' > "$OUT_DIR/sources.txt"
 find "$OUT_DIR/gen" -name '*.java' >> "$OUT_DIR/sources.txt"
 
-"$JAVA_HOME/bin/javac" \
-    -source 17 -target 17 \
-    -encoding UTF-8 \
-    -classpath "$ANDROID_JAR" \
-    -d "$OUT_DIR/classes" \
-    -nowarn \
-    @"$OUT_DIR/sources.txt" 2>&1 | grep -v '^Note:' || true
+# 注意：必须检查 javac 的退出码。此前用 `| grep ... || true` 把失败吞掉了，
+# 结果是「编译报错但脚本继续跑」，最后用旧的 class 打包出一个看似成功的 APK。
+javac_log="$OUT_DIR/javac.log"
+if ! "$JAVA_HOME/bin/javac" \
+        -source 17 -target 17 \
+        -encoding UTF-8 \
+        -classpath "$ANDROID_JAR" \
+        -d "$OUT_DIR/classes" \
+        -nowarn \
+        @"$OUT_DIR/sources.txt" >"$javac_log" 2>&1; then
+    warn "Java 编译失败："
+    grep -v '^注:' "$javac_log" | head -30 >&2
+    echo >&2
+    die "请修复上述错误后重试（完整日志：${javac_log}）"
+fi
+grep -v '^注:' "$javac_log" | head -10 || true
 
 if [ ! -d "$OUT_DIR/classes/com/bleunlock/remote" ]; then
     die "Java 编译失败（没有产生 class 文件）"

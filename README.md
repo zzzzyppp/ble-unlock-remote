@@ -7,6 +7,8 @@
 [![Platform: Android 8+](https://img.shields.io/badge/Android-8.0%2B-3DDC84.svg)](#系统要求)
 [![Release](https://img.shields.io/github/v/release/zzzzyppp/ble-unlock-remote)](https://github.com/zzzzyppp/ble-unlock-remote/releases/latest)
 
+**中文** · [English](README.en.md)
+
 手机通过低功耗蓝牙（BLE）向 Mac 发送一条带 **HMAC-SHA256 签名**的指令，Mac 校验通过后
 自动输入登录密码解锁屏幕。一台手机可以保存多台 Mac 的密钥，随时切换。
 
