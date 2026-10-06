@@ -13,7 +13,7 @@ Your phone sends an **HMAC-SHA256 signed** command to the Mac over Bluetooth Low
 Energy. Once verified, the Mac types your login password for you. One phone can
 hold the credentials for several Macs and switch between them.
 
-![BLE Unlock demo](docs/demo-en.gif)
+![BLE Unlock demo](https://cdn.jsdelivr.net/gh/zzzzyppp/ble-unlock-remote@main/docs/demo-en.gif)
 
 [▶ Video version (1080p MP4, 16s)](docs/demo-en.mp4)　·　[中文说明](README.md)
 
@@ -506,6 +506,16 @@ BLE Unlock.app                          ← drag into Applications
 
 Code signing goes from the inside out: the nested service first, then the outer app.
 Installation copies with `ditto` so nested signatures and extended attributes survive.
+
+---
+
+
+> **Why do the images use an absolute CDN URL instead of a repo-relative path?**
+> GitHub renders relative image paths in a README as `/owner/repo/raw/...`, which
+> 302-redirects to `raw.githubusercontent.com`. That host is unreachable from some
+> networks (commonly mainland China), leaving the image **broken**.
+> Serving it through jsDelivr makes it load. Please do not change these back to
+> relative paths.
 
 ---
 

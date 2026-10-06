@@ -12,7 +12,7 @@
 手机通过低功耗蓝牙（BLE）向 Mac 发送一条带 **HMAC-SHA256 签名**的指令，Mac 校验通过后
 自动输入登录密码解锁屏幕。一台手机可以保存多台 Mac 的密钥，随时切换。
 
-![BLE Unlock 演示](docs/demo-zh.gif)
+![BLE Unlock 演示](https://cdn.jsdelivr.net/gh/zzzzyppp/ble-unlock-remote@main/docs/demo-zh.gif)
 
 [▶ 视频版（1080p MP4，16 秒）](docs/demo-zh.mp4)　·　[English demo](README.en.md)
 
@@ -117,6 +117,16 @@ chmod +x mac-ble-unlock.sh
 
 每台 Mac 各自跑一次安装脚本、各自得到令牌，在 App 里「＋ 添加 Mac」逐台加入。
 用「切换 Mac」切换，`●` 表示当前连接的那台。同一时刻只连接选中的那一台。
+
+---
+
+
+> **为什么图片用 CDN 绝对地址而不是仓库相对路径？**
+> GitHub 会把 README 里的相对图片路径渲染成 `/owner/repo/raw/...`，
+> 该地址 302 跳转到 `raw.githubusercontent.com`。部分网络环境（含中国大陆常见线路）
+> 无法访问该域名，导致**图片显示为坏图**。
+> 改用 jsDelivr（可访问）后图片才能正常加载。
+> 编辑 README 时请勿把图片改回相对路径。
 
 ---
 
