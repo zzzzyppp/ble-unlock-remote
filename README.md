@@ -14,6 +14,8 @@
 
 ![BLE Unlock 演示](docs/demo-zh.gif)
 
+[▶ 视频版（1080p MP4，16 秒）](docs/demo-zh.mp4)　·　[English demo](README.en.md)
+
 ---
 
 ## 特性
@@ -474,6 +476,7 @@ BLE Unlock.app                          ← 拖进「应用程序」的设置 Ap
 │   │   ├── Installer.swift         ← 安装逻辑
 │   │   └── BuildInfo.swift         ← 版本信息（构建时生成）
 │   └── test/                       ← 安装逻辑的端到端测试
+├── build-video.sh                  ← 生成介绍视频（1080p MP4）
 ├── verify-protocol.sh              ← 跨语言协议一致性验证
 ├── verify-multikey.sh              ← 令牌解析 / 多密钥存储 / 迁移验证
 └── tools/

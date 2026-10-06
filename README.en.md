@@ -15,6 +15,8 @@ hold the credentials for several Macs and switch between them.
 
 ![BLE Unlock demo](docs/demo-en.gif)
 
+[▶ Video version (1080p MP4, 16s)](docs/demo-en.mp4)　·　[中文说明](README.md)
+
 ---
 
 ## Features
@@ -472,6 +474,7 @@ If none exists it creates one and tightens permissions (dir 700 / file 600).
 │   │   └── BuildInfo.swift         ← version info (generated at build time)
 │   ├── strings/                    ← en.lproj / zh-Hans.lproj
 │   └── test/                       ← end-to-end tests for the install logic
+├── build-video.sh                  ← builds the demo video (1080p MP4)
 ├── verify-protocol.sh              ← cross-language protocol verification
 ├── verify-multikey.sh              ← token / storage / migration verification
 └── tools/

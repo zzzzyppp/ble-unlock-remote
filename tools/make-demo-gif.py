@@ -61,6 +61,11 @@ def set_lang_fonts(lang):
     _fonts.clear()
 
 
+def fs(size):
+    """字号随分辨率缩放"""
+    return max(8, int(round(size * SCALE_F)))
+
+
 def font(size):
     if size in _fonts:
         return _fonts[size]
@@ -146,10 +151,10 @@ class Scene:
         layer.alpha_composite(big, (int(round(x0)), int(round(y0))))
 
     def text(self, layer, xy, s, size, fill, anchor="la"):
-        ImageDraw.Draw(layer).text(xy, s, font=font(size), fill=fill, anchor=anchor)
+        ImageDraw.Draw(layer).text(xy, s, font=font(fs(size)), fill=fill, anchor=anchor)
 
     def tw(self, s, size):
-        return font(size).getbbox(s)[2]
+        return font(fs(size)).getbbox(s)[2]
 
     def put(self, layer):
         self.img.paste(Image.alpha_composite(self.img.convert("RGBA"), layer).convert("RGB"),
@@ -203,9 +208,25 @@ S = {
 }
 
 # 布局
-W, H = 1200, 675
+# 基准布局（1200x675）。其它分辨率按同一系数整体缩放，
+# 这样视频版可以直接用 1920x1080 渲染，而不是把小图放大。
+BASE_W, BASE_H = 1200, 675
+W, H = BASE_W, BASE_H
+SCALE_F = 1.0
 PHONE = dict(x=150, y=118, w=252, h=486, r=36)
 MAC = dict(x=690, y=152, w=430, h=296, r=12)
+
+
+def set_resolution(width, height):
+    """按目标分辨率重算画布与设备布局（等比，保持构图不变）"""
+    global W, H, SCALE_F, PHONE, MAC
+    W, H = int(width), int(height)
+    SCALE_F = H / BASE_H
+    f = SCALE_F
+    PHONE = dict(x=int(150 * f), y=int(118 * f), w=int(252 * f), h=int(486 * f),
+                 r=int(36 * f))
+    MAC = dict(x=int(690 * f), y=int(152 * f), w=int(430 * f), h=int(296 * f),
+               r=max(6, int(12 * f)))
 
 # 时间线：每幕 (名称, 时长秒)
 TIMELINE = [("title", 1.5), ("unlock", 3.9), ("pick", 4.1), ("fallback", 4.7),
@@ -558,7 +579,10 @@ def fresh_state(st):
 
 
 def render(lang, out_path, scale=1.0, fps=25, optimize=True,
-           global_palette=True, colors=128, dither=Image.NONE):
+           global_palette=True, colors=128, dither=Image.NONE,
+           resolution=None, export_raw=None):
+    if resolution:
+        set_resolution(*resolution)
     set_lang_fonts(lang)
     st = dict(S[lang])
     frames = []
@@ -616,6 +640,16 @@ def render(lang, out_path, scale=1.0, fps=25, optimize=True,
         for img in raw:
             frames.append(img.quantize(palette=base, dither=dither))
 
+    if export_raw:
+        os.makedirs(export_raw, exist_ok=True)
+        for idx, img in enumerate(raw):
+            img.save(os.path.join(export_raw, "f%05d.png" % idx))
+        print("  已导出 %d 张 PNG 到 %s" % (len(raw), export_raw))
+
+    # 只导出 PNG 时（视频路径）不做 GIF 编码——帧已经落盘了
+    if export_raw:
+        return made, raw
+
     # optimize=True 会合并完全相同的帧，导致"第 N 帧"不再对应第 N/fps 秒。
     # 检查关键画面时要按时间戳取原始帧，所以这里把 raw 一并返回。
     frames[0].save(out_path, save_all=True, append_images=frames[1:],
@@ -641,14 +675,33 @@ def main():
                     help="开启抖动（渐变背景上会显著增大体积，默认关闭）")
     ap.add_argument("--per-frame-palette", action="store_true",
                     help="逐帧自适应调色板（体积更大，仅对比用）")
+    ap.add_argument("--resolution", default=None, metavar="WxH",
+                    help="渲染分辨率，如 1920x1080（默认 1200x675）")
+    ap.add_argument("--export-png", default=None, metavar="目录",
+                    help="导出全部原始 PNG 帧（供视频编码用），不生成 GIF")
     a = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    res = None
+    if a.resolution:
+        w, h = a.resolution.lower().split("x")
+        res = (int(w), int(h))
+
+    if a.export_png:
+        # 视频路径：导出原始帧即可，不需要 GIF 编码
+        n, raw = render(a.lang, "/dev/null", a.scale, a.fps,
+                        global_palette=True, colors=a.colors,
+                        dither=Image.NONE, resolution=res,
+                        export_raw=a.export_png)
+        print("  %d 帧已就绪（%dx%d @ %dfps）" % (n, W, H, a.fps))
+        return
+
     out = a.out or os.path.join(root, "docs", "demo-%s.gif" % a.lang)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     n, raw = render(a.lang, out, a.scale, a.fps, optimize=not a.no_optimize,
                     global_palette=not a.per_frame_palette, colors=a.colors,
-                    dither=Image.FLOYDSTEINBERG if a.dither else Image.NONE)
+                    dither=Image.FLOYDSTEINBERG if a.dither else Image.NONE,
+                    resolution=res)
     mb = os.path.getsize(out) / 1024 / 1024
     print("  %s：%d 帧，%.2f MB" % (out, n, mb))
 
