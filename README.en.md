@@ -13,6 +13,8 @@ Your phone sends an **HMAC-SHA256 signed** command to the Mac over Bluetooth Low
 Energy. Once verified, the Mac types your login password for you. One phone can
 hold the credentials for several Macs and switch between them.
 
+![BLE Unlock demo](docs/demo-en.gif)
+
 ---
 
 ## Features
