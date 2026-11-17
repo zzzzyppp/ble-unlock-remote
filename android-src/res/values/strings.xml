@@ -105,4 +105,14 @@
     <string name="s100">锁定 Mac</string>
     <string name="s101">＋ 添加 Mac</string>
     <string name="s102">，正在连接…</string>
+
+    <!-- 1.4.2 连接流程重做：可重试错误与进行中文案 -->
+    <string name="s103">正在连接，请稍候…</string>
+    <string name="s104">正在重试：</string>
+    <string name="s105">连接失败，可点「重新连接」重试</string>
+    <string name="s106">已清除失效的缓存地址</string>
+    <string name="s107">正在校验 Mac 身份…</string>
+    <string name="s108">未找到目标 Mac，正在重试…</string>
+    <string name="s109">连接超时，正在重试…</string>
+    <string name="s110">正在初始化…</string>
 </resources>

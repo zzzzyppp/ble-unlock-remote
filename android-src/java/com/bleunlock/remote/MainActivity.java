@@ -111,11 +111,14 @@ public class MainActivity extends Activity {
         handler.post(uiRefresh);
         ensurePermissions();
         renderState();
+        handler.removeCallbacks(startServiceRetry);
+        handler.postDelayed(startServiceRetry, 800);
     }
 
     @Override
     protected void onPause() {
         handler.removeCallbacks(uiRefresh);
+        handler.removeCallbacks(startServiceRetry);
         super.onPause();
     }
 
@@ -481,7 +484,13 @@ public class MainActivity extends Activity {
                     Toast.makeText(this, getString(R.string.s43), Toast.LENGTH_SHORT).show();
                     if (wasSelected) {
                         MacEntryStore.Entry next = store.selected();
-                        if (next != null) selectMac(next.id);
+                        if (next != null) {
+                            selectMac(next.id);
+                        } else {
+                            // 删掉的是最后一台 Mac：必须停掉前台服务，否则 wantConnection 仍为
+                            // true，服务会带着已删除的条目继续扫描，并在每次开机时被拉起。
+                            stopConnection();
+                        }
                     }
                     renderState();
                 })
@@ -575,16 +584,22 @@ public class MainActivity extends Activity {
             showEditDialog(null);
             return;
         }
-        Intent stop = new Intent(this, BleService.class);
-        stop.setAction(BleService.ACTION_STOP);
-        startService(stop);
-
-        Intent start = new Intent(this, BleService.class);
-        start.setAction(BleService.ACTION_START);
-        startServiceSafely(start);
+        // 只发 RECONNECT：由服务内部取消旧连接/扫描并重扫。
+        // 旧版「先 STOP 再 START」会在 stopSelf() 尚未完成时收到 START，
+        // 导致新 Intent 被吞掉、界面一直停在「连接中」。
+        Intent intent = new Intent(this, BleService.class);
+        intent.setAction(BleService.ACTION_RECONNECT);
+        startServiceSafely(intent);
 
         handler.postDelayed(this::bindToService, 300);
         Toast.makeText(this, getString(R.string.s68), Toast.LENGTH_SHORT).show();
+    }
+
+    /** 没有可连接的 Mac 时停掉前台服务，并清掉开机自恢复的 wantConnection。 */
+    private void stopConnection() {
+        Intent intent = new Intent(this, BleService.class);
+        intent.setAction(BleService.ACTION_STOP);
+        startServiceSafely(intent);
     }
 
     private void ensureServiceRunning() {
@@ -593,6 +608,21 @@ public class MainActivity extends Activity {
         start.setAction(BleService.ACTION_START);
         startServiceSafely(start);
     }
+
+    /**
+     * 兜底重试：某些 ROM 会在解锁/冷启动瞬间发 BOOT_COMPLETED，接收器抢跑导致前台服务
+     * 启动被拒（Background started FGS: Disallowed），Activity 自己的启动请求也可能被同一
+     * 限制吞掉。这里在界面真正可见后再补一次，确保不会永久停在「未连接」。
+     */
+    private final Runnable startServiceRetry = new Runnable() {
+        @Override
+        public void run() {
+            if (service == null) {
+                ensureServiceRunning();
+                bindToService();
+            }
+        }
+    };
 
     private void startServiceSafely(Intent intent) {
         try {

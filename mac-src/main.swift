@@ -7,6 +7,7 @@
 // 依赖：CoreBluetooth / CryptoKit / CoreGraphics / IOKit（全部为系统框架）
 
 import Foundation
+import AppKit
 import CoreBluetooth
 import CryptoKit
 import CoreGraphics
@@ -83,11 +84,21 @@ let kLogFileWritable: Bool = {
 
 // MARK: - 日志
 
+/// 日志时间戳精确到毫秒：连接/广播是秒级甚至百毫秒级的事，
+/// 只有整秒精度无法判断「唤醒→广播恢复」到底花了多久。
 let logFormatter: DateFormatter = {
     let f = DateFormatter()
-    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
     return f
 }()
+
+/// 日志会同时来自 CoreBluetooth 回调队列（主队列）与解锁专用队列，
+/// 加锁保证一行日志不会被另一次写入截断（tail/log show 解析时更可靠）。
+let logLock = NSLock()
+
+/// daemon-status.json 的写入串行锁：现在既会从主队列（刷新定时器 / 启动）写，
+/// 也会从 unlockQueue（解锁开始时）写；原子写 + 串行化避免设置向导读到半截 JSON。
+let daemonStatusLock = NSLock()
 
 /// 记录守护进程自身的 TCC 权限状态，供设置向导判断"真正干活的进程"能否输入。
 func writeDaemonStatus() {
@@ -99,9 +110,16 @@ func writeDaemonStatus() {
         "bundlePath": Bundle.main.bundlePath,
     ]
     if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
-        try? data.write(to: URL(fileURLWithPath: kStatusPath))
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
-                                               ofItemAtPath: kStatusPath)
+        // .atomic：先写临时文件再 rename，读取方（设置向导）不会看到半截内容。
+        daemonStatusLock.lock()
+        defer { daemonStatusLock.unlock() }
+        do {
+            try data.write(to: URL(fileURLWithPath: kStatusPath), options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                   ofItemAtPath: kStatusPath)
+        } catch {
+            log("[状态] 写入 daemon-status.json 失败：\(error.localizedDescription)")
+        }
     }
     log("守护进程权限自检：AXIsProcessTrusted = \(trusted)")
     if !trusted {
@@ -112,6 +130,8 @@ func writeDaemonStatus() {
 }
 
 func log(_ message: String) {
+    logLock.lock()
+    defer { logLock.unlock() }
     let line = "[\(logFormatter.string(from: Date()))] \(message)\n"
     FileHandle.standardError.write(line.data(using: .utf8)!)
     if kLogFileWritable, let handle = FileHandle(forWritingAtPath: kLogPath) {
@@ -400,6 +420,17 @@ func accessibilityGranted(prompt: Bool = false) -> Bool {
 
 // MARK: - 解锁 / 锁定
 
+/// 解锁/锁定专用的串行队列。
+///
+/// BLE 回调跑在主队列（`CBPeripheralManager(delegate:queue:)` 传 nil 即主队列），
+/// 而解锁流程里有 fork/exec（`/usr/bin/security`）、`Thread.sleep`、`dlopen` 等阻塞操作。
+/// 直接在回调里同步执行会堵住 `didReceiveWrite` / `didSubscribeTo` / 状态通知，
+/// 手机端表现为「已经连上，却迟迟等不到响应/确认」——这是连接慢的主要放大器之一。
+///
+/// 所有指令处理都放到这个串行队列：既离开主队列，又保持指令串行执行，
+/// `unlockInFlight` 仍是单线程语义，无需额外加锁。
+let unlockQueue = DispatchQueue(label: "jp.sone.bleunlockcmd.unlock", qos: .userInitiated)
+
 var unlockInFlight = false
 
 /// 自动解锁：唤醒屏幕 -> 确认处于锁屏 -> 注入密码
@@ -414,7 +445,11 @@ var unlockInFlight = false
 func performUnlock(preferredIndex: UInt8? = nil,
                    force: Bool = false,
                    reply: @escaping (String) -> Void) {
+    // 本函数只应在 unlockQueue 上执行（BLE 指令统一由 PeripheralServer 转过来）。
+    // 下面的 fork/exec（读钥匙串）、Thread.sleep、dlopen 都不会占用 CB 回调队列。
+    log("[UNLOCK] 处理解锁请求（force=\(force)，preferredIndex=\(preferredIndex.map { String($0) } ?? "无")）")
     guard !unlockInFlight else {
+        log("[UNLOCK] 拒绝：上一次解锁尚未结束")
         reply("BUSY")
         return
     }
@@ -467,11 +502,11 @@ func performUnlock(preferredIndex: UInt8? = nil,
         // 注意：force 可能不带序号（手机只要求"跳过校验"），
         // 此时 passwords[0] 就是保存顺序里的第一个，即默认密码。
         let chosen = passwords[0]
-        log("收到强制填充指令（跳过锁屏校验，共 \(passwords.count) 个密码）")
+        log("[UNLOCK] 收到强制填充指令（跳过锁屏校验，共 \(passwords.count) 个密码）")
         // 屏幕若在息屏状态，输入框收不到按键，因此仍先点亮屏幕
         wakeDisplay()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            log("注入 \(chosen.count) 个字符并回车")
+        unlockQueue.asyncAfter(deadline: .now() + 0.35) {
+            log("[UNLOCK] 注入 \(chosen.count) 个字符并回车")
             fakeKeyStrokes(chosen)
             unlockInFlight = false
             reply("OK")
@@ -479,7 +514,7 @@ func performUnlock(preferredIndex: UInt8? = nil,
         return
     }
 
-    log("收到解锁指令，开始执行（\(passwords.count) 个密码待尝试）")
+    log("[UNLOCK] 开始执行（\(passwords.count) 个密码待尝试）")
 
     wakeDisplay()
 
@@ -493,9 +528,9 @@ func performUnlock(preferredIndex: UInt8? = nil,
     func succeeded(after tried: Int) {
         unlockInFlight = false
         if tried == 0 {
-            log("已注入密码并回车，解锁指令完成")
+            log("[UNLOCK] 完成：已注入密码并回车")
         } else {
-            log("第 \(tried + 1) 个密码生效，解锁指令完成")
+            log("[UNLOCK] 完成：第 \(tried + 1) 个密码生效")
         }
         reply("OK")
     }
@@ -504,7 +539,7 @@ func performUnlock(preferredIndex: UInt8? = nil,
     func tryPassword(at index: Int) {
         guard index < passwords.count else {
             unlockInFlight = false
-            log("已尝试全部 \(passwords.count) 个密码，屏幕仍未解锁")
+            log("[UNLOCK] 失败：已尝试全部 \(passwords.count) 个密码，屏幕仍未解锁")
             reply("ERR_ALL_PW")
             return
         }
@@ -514,6 +549,9 @@ func performUnlock(preferredIndex: UInt8? = nil,
 
         // 尝试前先清空输入框：上一个密码若错误，字段里可能残留内容。
         // 用 Esc 清空比逐字符删除可靠。
+        //
+        // 这里的阻塞式 sleep 只占用 unlockQueue（专用串行队列），
+        // 不会阻塞 CoreBluetooth 回调队列；保留它可维持原有的注入节奏。
         if index > 0 {
             sendKey(0x35)   // Esc
             Thread.sleep(forTimeInterval: 0.25)
@@ -521,7 +559,7 @@ func performUnlock(preferredIndex: UInt8? = nil,
 
         fakeKeyStrokes(passwords[index])
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) {
+        unlockQueue.asyncAfter(deadline: .now() + settleDelay) {
             if !isScreenLocked() {
                 succeeded(after: index)
             } else {
@@ -537,7 +575,7 @@ func performUnlock(preferredIndex: UInt8? = nil,
 
         if isScreenLocked() {
             // 再等 0.4s 让密码输入框获得焦点
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            unlockQueue.asyncAfter(deadline: .now() + 0.4) {
                 tryPassword(at: 0)
             }
             return
@@ -545,11 +583,11 @@ func performUnlock(preferredIndex: UInt8? = nil,
 
         if wakeAttempt >= maxWakeAttempts {
             unlockInFlight = false
-            log("解锁中止：屏幕未处于锁定状态（可能已由用户手动解锁）")
+            log("[UNLOCK] 中止：屏幕未处于锁定状态（可能已由用户手动解锁）")
             reply("NOT_LOCKED")
             return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: tick)
+        unlockQueue.asyncAfter(deadline: .now() + 0.5, execute: tick)
     }
 
     tick()
@@ -561,7 +599,9 @@ func performLock(reply: @escaping (String) -> Void) {
         reply("OK")
         return
     }
-    log("收到锁定指令")
+    // 与 performUnlock 一样，本函数只在 unlockQueue 上执行：
+    // dlopen/SACLockScreenImmediate 首次加载可能有几十毫秒，不能拖住 CB 回调。
+    log("[LOCK] 开始执行锁定")
     // 通过锁屏私有 API 锁定；若不可用则退回屏保
     let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/login", RTLD_NOW)
     if let handle = handle, let sym = dlsym(handle, "SACLockScreenImmediate") {
@@ -569,10 +609,10 @@ func performLock(reply: @escaping (String) -> Void) {
         let lock = unsafeBitCast(sym, to: LockFn.self)
         let result = lock()
         dlclose(handle)
-        log("SACLockScreenImmediate 返回 \(result)")
+        log("[LOCK] SACLockScreenImmediate 返回 \(result)")
         reply(result == 0 ? "OK" : "ERR_LOCK")
     } else {
-        log("login.framework 不可用，改用屏保锁定")
+        log("[LOCK] login.framework 不可用，改用屏保锁定")
         Process.launchedProcess(launchPath: "/usr/bin/open",
                                 arguments: ["-a", "ScreenSaverEngine"])
         reply("OK_SS")
@@ -652,10 +692,559 @@ final class PeripheralServer: NSObject, CBPeripheralManagerDelegate {
     private var advertiseTimer: Timer?
     private var statusValue = "READY"
 
+    // MARK: 广播生命周期状态（全部只在 CoreBluetooth 回调队列 / 主队列上读写）
+
+    /// GATT 服务是否已被 didAdd 确认注册成功。**只有为 true 才允许广播。**
+    private var serviceBuilt = false
+    /// add(service) 已提交、didAdd 尚未回调；用于防止重复 add。
+    private var serviceAddPending = false
+    /// 提交 add(service) 的时刻。didAdd 迟迟不来（系统刚唤醒时可能丢回调）时用它超时重试。
+    private var serviceAddStartedAt: Date?
+    /// 服务注册连续失败次数（didAdd 报错，或超过 2 s 没等到 didAdd）。
+    /// 达到上限后重建 CBPeripheralManager：唤醒后 CoreBluetooth 偶发彻底不再回调 didAdd，
+    /// 只重复 add/remove 会变成「永不广播 + 每 2.5 s 无限重建」。
+    private var serviceAddFailCount = 0
+    /// 广播失败后的降级标志：去掉 localName，只保留 service UUID。
+    private var reducedAdvertising = false
+    private var advertisingStartCount = 0
+    private var advertisingFailCount = 0
+    /// 最近一次 startAdvertising 的时刻，用于计算「开始广播 → 手机连上」的耗时。
+    private var lastAdvertisingStartedAt: Date?
+    /// 已订阅（即已连接）的手机。用于判断唤醒时能否安全地重建 GATT 数据库。
+    private var subscribedCentrals: Set<UUID> = []
+    private var pendingStatus: String?
+
+    // MARK: 「假在线」兜底状态（主队列）
+
+    /// 最近一次手机侧活动（订阅 / 读 / 写 / 取消订阅）的时刻。
+    /// t9 已证明 CoreBluetooth 会返回 didStartAdvertising 成功、isAdvertising=true，
+    /// 但 controller 层可能根本没有广播；此时唯一能观察到的“活着”迹象就是手机侧活动。
+    private var lastCentralActivity = Date()
+    /// idle 强制 re-arm 的定时器（5 s tick）。
+    private var idleRearmTimer: Timer?
+    /// 最近一次强制 re-arm 的时刻，保证两次 re-arm 至少间隔 20 s。
+    private var lastRearmAt: Date?
+    /// 连续 re-arm 次数（期间没有任何手机活动）。≥2 且最近一次广播后仍长时间无活动时，
+    /// 才判定 controller“假在线”并升级为移除服务重建。
+    private var consecutiveRearms = 0
+    /// 广播操作串行闸门：stop → 延迟 start / 深度重建期间置位，
+    /// 避免 watchdog、2.5 s 健康检查、唤醒重建在同一窗口里互相打断。
+    private var advertisingOperationUntil: Date?
+    /// 深度重建后的冷却期：避免「一直没人连」时每 40 s 就 removeAllServices 一次
+    /// （反复重建 GATT 数据库会让手机侧缓存反复失效，得不偿失）。
+    private var deepRebuildCooldownUntil: Date?
+    /// 深度重建的指数退避档位：60 s → 5 min → 30 min。只有「确实像 controller 卡死」
+    /// 时才会升级重建，升级一次后退避档 +1，避免正常无人使用时周期性重建污染测量。
+    private var deepRebuildBackoffIndex = 0
+    /// 已完成的深度重建次数（日志/状态用）。
+    private var deepRebuildCount = 0
+    /// 待办：深度重建（闸门忙时登记，闸门释放后重试，不得静默丢弃）。
+    private var pendingDeepRebuild = false
+    private var pendingDeepRebuildReason: String?
+    /// 深度重建的静默确认时刻：最后一次 CB 回调后至少 3 s 才 removeAllServices，
+    /// 覆盖「链路已建立、但服务发现/订阅还没完成」这段对代码不可见的窗口。
+    private var deepRebuildConfirmAt: Date?
+    /// 待办：轻量重建广播（闸门忙时登记）。
+    private var pendingRestartReason: String?
+    /// 待办：确保广播（闸门忙时登记）。
+    private var pendingEnsureReason: String?
+    /// 待办：强制 re-arm（闸门忙时登记；必须在闸门释放后真正重跑 forceRearm，
+    /// 因为 isAdvertising 可能是假 true，走 ensureAdvertising 会被它挡住）。
+    private var pendingRearmReason: String?
+    /// 待办刷新是否已排期 / 已重试次数（防止无界重试）。
+    private var pendingFlushScheduled = false
+    private var pendingFlushAttempts = 0
+    /// 连续 startAdvertising 成功次数：降级载荷后连续 2 次成功即恢复完整载荷。
+    private var advertisingSuccessStreak = 0
+    /// 健康检查日志去抖：只在「广播是否在跑」翻转时写，避免重建循环时每 2.5 s 刷屏。
+    private var lastHealthAdvertisingOK: Bool?
+
     func start(key: SymmetricKey, deviceName: String) {
         self.key = key
         self.deviceName = deviceName
+        log("[BLE] 守护进程启动：创建 CBPeripheralManager（回调队列=主队列），就绪后立即注册服务并广播")
         manager = CBPeripheralManager(delegate: self, queue: nil)
+
+        // 启动自检：即使 poweredOn 回调因系统刚唤醒而迟到/丢失，
+        // 500 ms 后也会再确认一次广播状态。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.ensureAdvertising(reason: "启动自检")
+        }
+    }
+
+    private func stateName(_ state: CBManagerState) -> String {
+        switch state {
+        case .poweredOn:    return "poweredOn"
+        case .poweredOff:   return "poweredOff"
+        case .unauthorized: return "unauthorized"
+        case .unsupported:  return "unsupported"
+        case .resetting:    return "resetting"
+        case .unknown:      return "unknown"
+        @unknown default:   return "unknown(\(state.rawValue))"
+        }
+    }
+
+    // MARK: 广播时序：addService → didAdd 成功 → startAdvertising
+
+    /// 确保（在服务就绪的前提下）处于广播状态。可从任意主队列回调/定时器调用。
+    func ensureAdvertising(reason: String) {
+        guard manager != nil else { return }
+        guard manager.state == .poweredOn else {
+            log("[ADV] 暂不广播（\(reason)）：蓝牙状态=\(stateName(manager.state))")
+            return
+        }
+        // 串行闸门：watchdog / 2.5 s 健康检查 / 唤醒重建正在 stop→start 时，
+        // 不再插入新的广播操作，避免重复 start/stop 互相打断。
+        // 注意：这里必须“登记待办 + 重试”，不能只 return——上一版就是自己安排的
+        // 延迟回调被自己的闸门挡掉且不重试，导致取消订阅/唤醒后出现 1.3–3.5 s 盲区（t11 F1）。
+        guard !advertisingOperationInFlight() else {
+            log("[ADV][ERROR] ensureAdvertising(\(reason)) 被串行闸门挡掉：登记待办，闸门释放后重试")
+            pendingEnsureReason = reason
+            schedulePendingFlush()
+            return
+        }
+        // 关键顺序：add(service) 是异步的。必须等 didAdd 成功后再 startAdvertising，
+        // 否则手机可能在 GATT 数据库还没注册好时就连上，服务发现失败 → 断开重连，
+        // 表现为「第一次连接总是很慢/失败」。
+        if !serviceBuilt {
+            if !serviceAddPending {
+                log("[GATT] 服务尚未就绪（\(reason)）：先注册服务，didAdd 成功后再广播")
+                buildService()
+            }
+            return
+        }
+        guard !manager.isAdvertising else { return }   // 已在广播：不做多余调用
+        startAdvertising(reason: reason)
+    }
+
+    /// 广播载荷。降级后去掉本地名：Android 端按 service UUID 过滤，不影响发现。
+    private func advertisePayload() -> [String: Any] {
+        var payload: [String: Any] = [CBAdvertisementDataServiceUUIDsKey: [kServiceUUID]]
+        if !reducedAdvertising {
+            payload[CBAdvertisementDataLocalNameKey] = deviceName
+        }
+        return payload
+    }
+
+    /// 真正调用 `startAdvertising` 的唯一入口（全文件只在 ::782 调一次 CB API）。
+    /// - Parameter force: 为 true 时跳过「已在广播」守卫。
+    ///   「假在线」场景下 CoreBluetooth 会认为 isAdvertising=true，但 controller 从未广播，
+    ///   这时必须无视该状态重新下发布广播请求，否则永远不会自愈。
+    private func startAdvertising(reason: String, force: Bool = false) {
+        guard manager.state == .poweredOn, serviceBuilt else { return }
+        if !force {
+            guard !manager.isAdvertising else { return }
+        }
+        advertisingStartCount += 1
+        lastAdvertisingStartedAt = Date()
+        let name = reducedAdvertising ? "(已降级，不带名称)" : deviceName
+        log("[ADV] 开始广播 #\(advertisingStartCount)（\(reason)）service=\(kServiceUUID.uuidString) name=\(name)"
+            + " isAdvertising=\(manager.isAdvertising) 订阅数=\(subscribedCentrals.count)"
+            + " re-arm=\(consecutiveRearms) force=\(force)")
+        manager.startAdvertising(advertisePayload())
+    }
+
+    /// 立即重建广播（不会主动断开已连接的手机）。
+    /// - Parameter deep: 为 true 且当前没有手机连着时，连 GATT 服务一起移除并重新注册
+    ///   （系统睡眠唤醒后数据库可能已失效，只重启广播未必能被发现）。
+    func restartAdvertising(reason: String, deep: Bool = false) {
+        guard manager != nil, manager.state == .poweredOn else {
+            log("[ADV] 跳过重建广播（\(reason)）：蓝牙状态未就绪")
+            return
+        }
+        if deep && subscribedCentrals.isEmpty {
+            // 深重建统一入口：冷却期内一律降级为轻量重启。否则系统每次唤醒都会
+            // removeAllServices，合盖/自动唤醒频繁时等于周期性自毁手机侧 GATT 缓存。
+            if let cooldown = deepRebuildCooldownUntil, Date() < cooldown {
+                log("[ADV] 深度重建冷却中（\(reason)）：剩余 \(Int(cooldown.timeIntervalSinceNow))s，改为轻量重建")
+                restartAdvertising(reason: reason + "·冷却中降级", deep: false)
+                return
+            }
+            // 深度重建统一走 requestDeepRebuild：闸门忙时排队、removeAllServices 前做静默确认。
+            requestDeepRebuild(reason: reason)
+            return
+        }
+        guard !advertisingOperationInFlight() else {
+            log("[ADV][ERROR] restartAdvertising(\(reason), deep=\(deep)) 被串行闸门挡掉：登记待办后重试")
+            pendingRestartReason = reason
+            schedulePendingFlush()
+            return
+        }
+        if manager.isAdvertising {
+            log("[ADV] 重建广播（\(reason)）：先停止旧广播"
+                + " isAdvertising=\(manager.isAdvertising) 订阅数=\(subscribedCentrals.count)")
+            manager.stopAdvertising()
+        }
+        // stopAdvertising 之后立刻 start 有时会被系统忽略，间隔 100 ms 再启动。
+        // t11 F1：回调必须排在闸门到期之后，并在回调里先清掉闸门，否则
+        // ensureAdvertising 会被上一次操作自己设的闸门挡掉，广播要等 2.5 s 健康检查才恢复。
+        advertisingOperationUntil = Date().addingTimeInterval(0.35)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self = self else { return }
+            self.advertisingOperationUntil = nil
+            guard self.manager.state == .poweredOn else {
+                log("[ADV] 重建广播的延迟启动被跳过：蓝牙状态已变为 \(self.stateName(self.manager.state))")
+                return
+            }
+            if self.serviceBuilt {
+                // 直接强制下发布广请求：不受 isAdvertising 假值影响（假在线时它是 true）。
+                self.startAdvertising(reason: reason + "·延迟重启", force: true)
+            } else {
+                self.ensureAdvertising(reason: reason + "·延迟重启（等待服务就绪）")
+            }
+        }
+    }
+
+    // MARK: 「假在线」兜底：idle 强制 re-arm / 深度重建
+
+    /// 广播操作串行闸门。所有停止/重启/重建都必须先过这一层，
+    /// 保证同一时刻只有一条广播操作在跑（watchdog、健康检查、唤醒重建不会互相打断）。
+    private func advertisingOperationInFlight(now: Date = Date()) -> Bool {
+        if let until = advertisingOperationUntil {
+            if now < until { return true }
+            advertisingOperationUntil = nil
+        }
+        return false
+    }
+
+    /// 给日志用的广播/连接概况。t7 可直接 grep `[ADV]` 判定兜底是否生效。
+    private func advStateDescription() -> String {
+        let idle = Int(Date().timeIntervalSince(lastCentralActivity))
+        var text = "isAdvertising=\(manager?.isAdvertising ?? false) serviceBuilt=\(serviceBuilt)"
+            + " 订阅数=\(subscribedCentrals.count) 空闲=\(idle)s re-arm=\(consecutiveRearms)"
+            + " 启动次数=\(advertisingStartCount) 重建=\(deepRebuildCount)"
+        if pendingDeepRebuild { text += " 待重建=是" }
+        if pendingRestartReason != nil || pendingEnsureReason != nil { text += " 待重播=是" }
+        return text
+    }
+
+    // MARK: 深度重建的排队 / 静默确认 / 退避
+
+    /// 深度重建的指数退避间隔（秒）：60 → 300 → 1800。
+    private var deepRebuildBackoff: TimeInterval {
+        switch deepRebuildBackoffIndex {
+        case 0:  return 60
+        case 1:  return 300
+        default: return 1800
+        }
+    }
+
+    /// 请求深度重建：闸门忙时排队；否则等「最后一次 CB 回调后 ≥3 s」再真正 removeAllServices。
+    /// - 闸门忙时不再静默 return（t11 F2：唤醒深度重建曾被直接丢弃）。
+    /// - 静默确认（t11 F4）：peripheral 角色没有 didConnect 回调，手机「已连上但还没订阅」
+    ///   的那段时间代码是看不见的；此时 removeAllServices 会让首次服务发现失败后重连。
+    /// 深度重建前的静默窗口：peripheral 角色看不到 didConnect，手机「已连上、正在发现服务」
+    /// 这一两秒对代码不可见；窗口太短会在服务发现途中 removeAllServices，导致首次连接失败重连。
+    private let deepRebuildQuietWindow: TimeInterval = 10.0
+
+    private func requestDeepRebuild(reason: String) {
+        guard manager != nil, manager.state == .poweredOn else {
+            log("[ADV] 跳过深度重建（\(reason)）：蓝牙状态未就绪")
+            return
+        }
+        guard subscribedCentrals.isEmpty else {
+            log("[ADV] 跳过深度重建（\(reason)）：仍有 \(subscribedCentrals.count) 个订阅，避免打断连接")
+            return
+        }
+        if advertisingOperationInFlight() {
+            pendingDeepRebuild = true
+            pendingDeepRebuildReason = reason
+            log("[ADV][ERROR] 深度重建(\(reason)) 被串行闸门挡掉：已排队，闸门释放后重试 \(advStateDescription())")
+            schedulePendingFlush()
+            return
+        }
+        let quietFor = Date().timeIntervalSince(lastCentralActivity)
+        if quietFor >= deepRebuildQuietWindow {
+            // 距最后一次 CB 回调已 ≥3 s：没有「正在发现服务」的手机，立即重建。
+            performDeepRebuild(reason: reason)
+            return
+        }
+        // 最近 3 s 内还有 CB 活动：排队到「最后一次回调 + 3 s」再确认一次。
+        pendingDeepRebuild = true
+        pendingDeepRebuildReason = reason
+        deepRebuildConfirmAt = lastCentralActivity.addingTimeInterval(deepRebuildQuietWindow)
+        let delay = max(0.05, deepRebuildQuietWindow - quietFor + 0.05)
+        log("[ADV] 深度重建排队（\(reason)）：最近 \(String(format: "%.1f", quietFor))s 内有手机活动，"
+            + "等 \(String(format: "%.1f", delay))s 静默确认后再移除服务 \(advStateDescription())")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.performDeepRebuildIfQuiet()
+        }
+    }
+
+    /// 静默确认后执行深度重建；若确认期间手机又活动/闸门仍忙，则放弃或重试。
+    private func performDeepRebuildIfQuiet() {
+        guard pendingDeepRebuild else { return }
+        guard manager != nil, manager.state == .poweredOn else {
+            log("[ADV] 取消深度重建：蓝牙状态未就绪")
+            pendingDeepRebuild = false
+            pendingDeepRebuildReason = nil
+            deepRebuildConfirmAt = nil
+            return
+        }
+        if advertisingOperationInFlight() {
+            log("[ADV] 深度重建确认时闸门仍忙：继续排队重试 \(advStateDescription())")
+            schedulePendingFlush()
+            return
+        }
+        guard subscribedCentrals.isEmpty else {
+            log("[ADV] 取消深度重建：确认期间手机已订阅，避免打断连接 \(advStateDescription())")
+            pendingDeepRebuild = false
+            pendingDeepRebuildReason = nil
+            deepRebuildConfirmAt = nil
+            return
+        }
+        if let confirmAt = deepRebuildConfirmAt, Date() < confirmAt {
+            let delay = confirmAt.timeIntervalSinceNow + 0.05
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.performDeepRebuildIfQuiet()
+            }
+            return
+        }
+        if Date().timeIntervalSince(lastCentralActivity) < deepRebuildQuietWindow {
+            log("[ADV] 取消深度重建：确认期间仍有手机活动 \(advStateDescription())")
+            pendingDeepRebuild = false
+            pendingDeepRebuildReason = nil
+            deepRebuildConfirmAt = nil
+            return
+        }
+        let reason = pendingDeepRebuildReason ?? "深度重建"
+        pendingDeepRebuild = false
+        pendingDeepRebuildReason = nil
+        deepRebuildConfirmAt = nil
+        performDeepRebuild(reason: reason)
+    }
+
+    /// 真正的深度重建：stopAdvertising → removeAllServices → buildService → didAdd 后广播。
+    /// 顺序上必须「先 removeAllServices 再 buildService」，否则可能重复 add 同一个服务。
+    private func performDeepRebuild(reason: String) {
+        guard manager != nil, manager.state == .poweredOn, subscribedCentrals.isEmpty else { return }
+        deepRebuildCount += 1
+        log("[ADV] 深度重建 #\(deepRebuildCount)（\(reason)）：removeAllServices → buildService → didAdd 后广播"
+            + " \(advStateDescription())")
+        manager.stopAdvertising()
+        manager.removeAllServices()
+        serviceBuilt = false
+        serviceAddPending = false
+        serviceAddStartedAt = nil
+        statusValue = "READY"
+        pendingStatus = nil
+        // 闸门只覆盖 removeAllServices → 重新注册 之间的窗口；didAdd 回来时必须已经放开，
+        // 否则 didAdd → ensureAdvertising 会被当成「上一次操作尚未完成」挡掉（t11 F1 deep 分支）。
+        advertisingOperationUntil = Date().addingTimeInterval(0.2)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self = self, self.manager.state == .poweredOn else { return }
+            self.advertisingOperationUntil = nil
+            log("[ADV] 深度重建：重新注册 GATT 服务（didAdd 成功后会自动广播）")
+            self.buildService()
+        }
+    }
+
+    // MARK: 待办合并：闸门忙时的请求登记与重试
+
+    /// 排队一个待办刷新：0.5 s 后尝试；若闸门仍忙则继续退避重试（最多 8 次，绝不静默丢弃）。
+    private func schedulePendingFlush(after delay: TimeInterval = 0.5) {
+        guard !pendingFlushScheduled else { return }
+        pendingFlushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else { return }
+            self.pendingFlushScheduled = false
+            self.flushPendingWork()
+        }
+    }
+
+    private func flushPendingWork() {
+        guard manager != nil, manager.state == .poweredOn else {
+            pendingDeepRebuild = false
+            pendingDeepRebuildReason = nil
+            pendingRestartReason = nil
+            pendingEnsureReason = nil
+            pendingRearmReason = nil
+            deepRebuildConfirmAt = nil
+            pendingFlushAttempts = 0
+            return
+        }
+        if advertisingOperationInFlight() {
+            pendingFlushAttempts += 1
+            if pendingFlushAttempts > 8 {
+                log("[ADV][ERROR] 待办重试 8 次仍被闸门挡住，放弃本轮（等 watchdog/健康检查兜底）"
+                    + " 待重建=\(pendingDeepRebuild) 待重播=\(pendingRestartReason ?? "-") \(advStateDescription())")
+                pendingFlushAttempts = 0
+                pendingDeepRebuild = false
+                pendingDeepRebuildReason = nil
+                pendingRestartReason = nil
+                pendingEnsureReason = nil
+                pendingRearmReason = nil
+                return
+            }
+            log("[ADV] 待办重试第 \(pendingFlushAttempts) 次：闸门仍忙，0.5 s 后再试")
+            schedulePendingFlush()
+            return
+        }
+        pendingFlushAttempts = 0
+        performOnePendingWork()
+        // 一次只做一件：若还有其他待办（例如深度重建期间又来了唤醒请求），
+        // 顺延 0.3 s 再做，绝不静默丢弃。
+        if hasPendingWork {
+            schedulePendingFlush(after: 0.3)
+        }
+    }
+
+    private var hasPendingWork: Bool {
+        pendingDeepRebuild || pendingRestartReason != nil
+            || pendingEnsureReason != nil || pendingRearmReason != nil
+    }
+
+    private func performOnePendingWork() {
+        if pendingDeepRebuild {
+            log("[ADV] 执行排队的深度重建（reason=\(pendingDeepRebuildReason ?? "-")）")
+            performDeepRebuildIfQuiet()
+            return
+        }
+        if let reason = pendingRearmReason {
+            pendingRearmReason = nil
+            log("[ADV] 执行排队的强制 re-arm（reason=\(reason)）")
+            forceRearm(reason: reason + "·排队重试")
+            return
+        }
+        if let reason = pendingRestartReason {
+            pendingRestartReason = nil
+            log("[ADV] 执行排队的广播重建（reason=\(reason)）")
+            restartAdvertising(reason: reason + "·排队重试")
+            return
+        }
+        if let reason = pendingEnsureReason {
+            pendingEnsureReason = nil
+            log("[ADV] 执行排队的广播确认（reason=\(reason)）")
+            ensureAdvertising(reason: reason + "·排队重试")
+        }
+    }
+
+    /// 蓝牙关闭/重置时清空所有待办：这些请求依赖 poweredOn 状态，留着只会在下次启动时误触发。
+    private func clearPendingAdvertisingWork() {
+        if pendingDeepRebuild || pendingRestartReason != nil || pendingEnsureReason != nil || pendingRearmReason != nil {
+            log("[ADV] 蓝牙状态变化：清空待办的广播工作（待重建=\(pendingDeepRebuild)）")
+        }
+        pendingDeepRebuild = false
+        pendingDeepRebuildReason = nil
+        pendingRestartReason = nil
+        pendingEnsureReason = nil
+        pendingRearmReason = nil
+        deepRebuildConfirmAt = nil
+        pendingFlushAttempts = 0
+        deepRebuildCooldownUntil = nil
+        consecutiveRearms = 0
+        advertisingSuccessStreak = 0
+    }
+
+    /// idle watchdog：5 s tick。**不看 isAdvertising**，因为「假在线」时它是 true。
+    /// 触发条件：蓝牙就绪 + 当前无订阅 + 距上次手机活动 > 10 s + 距上次 re-arm ≥ 60 s。
+    private func startIdleRearmTimer() {
+        idleRearmTimer?.invalidate()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            self?.idleRearmCheck()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        idleRearmTimer = timer
+        log("[ADV] idle re-arm watchdog 已启动（tick=5s，静默>10s 触发，间隔≥60s）")
+    }
+
+    private func stopIdleRearmTimer() {
+        guard idleRearmTimer != nil else { return }
+        idleRearmTimer?.invalidate()
+        idleRearmTimer = nil
+        log("[ADV] idle re-arm watchdog 已停止（蓝牙未就绪）")
+    }
+
+    private func idleRearmCheck() {
+        guard manager != nil, manager.state == .poweredOn else { return }
+        // 有手机连着就绝不打断（真正在服务时优先保障连接稳定性）。
+        // 但睡眠/异常断开时可能收不到 didUnsubscribeFrom，订阅记录会永久残留，
+        // 让整套自愈永久失效——这里按「长时间零活动」判定为残留并清空。
+        if !subscribedCentrals.isEmpty {
+            let silence = Date().timeIntervalSince(lastCentralActivity)
+            if silence > 1800 {
+                log("[CONN][WARN] 订阅记录 \(subscribedCentrals.count) 个已 \(Int(silence)) s 无任何活动："
+                    + "判定为残留（未收到取消订阅回调），清空以恢复自愈能力")
+                subscribedCentrals.removeAll()
+            } else {
+                return
+            }
+        }
+        let now = Date()
+        let idle = now.timeIntervalSince(lastCentralActivity)
+        guard idle > 10 else { return }
+        if let last = lastRearmAt, now.timeIntervalSince(last) < 60 { return }
+        // 刚做过深度重建：按指数退避（60 s → 5 min → 30 min）冷静，避免反复 removeAllServices。
+        if let cooldown = deepRebuildCooldownUntil {
+            if now < cooldown { return }
+            deepRebuildCooldownUntil = nil
+        }
+        forceRearm(reason: String(format: "idle %.0f s 无手机活动", idle))
+    }
+
+    /// 强制 re-arm：**绕过 isAdvertising 门控**，先 stopAdvertising 再 startAdvertising。
+    /// 只有在「连续 re-arm 且确实像 controller 卡死」时才升级为深度重建：
+    /// 要求最近一次 startAdvertising 之后 ≥15 s 没有任何手机活动，并按 60 s→5 min→30 min 指数退避，
+    /// 避免正常无人使用时周期性 removeAllServices（t11 F3：会反复失效手机侧 GATT 缓存并污染测量）。
+    /// 所有操作都在主队列（CB 委托队列）上串行执行。
+    func forceRearm(reason: String) {
+        guard manager != nil else { return }
+        guard manager.state == .poweredOn else {
+            log("[ADV] 跳过强制 re-arm（\(reason)）：蓝牙状态=\(stateName(manager.state))")
+            return
+        }
+        if advertisingOperationInFlight() {
+            log("[ADV][ERROR] 强制 re-arm(\(reason)) 被串行闸门挡掉：登记待办后重试")
+            pendingRearmReason = reason
+            schedulePendingFlush()
+            return
+        }
+        guard serviceBuilt else {
+            log("[ADV] 强制 re-arm 推迟（\(reason)）：GATT 服务尚未就绪，先注册服务")
+            ensureAdvertising(reason: reason + "·等待服务就绪")
+            return
+        }
+        guard subscribedCentrals.isEmpty else {
+            log("[ADV] 跳过强制 re-arm（\(reason)）：仍有 \(subscribedCentrals.count) 个订阅，避免打断连接")
+            return
+        }
+
+        consecutiveRearms += 1
+        lastRearmAt = Date()
+        log("[ADV] 强制 re-arm #\(consecutiveRearms)（\(reason)）绕过 isAdvertising 门控：\(advStateDescription())")
+
+        // 升级判据：必须同时满足「连续 ≥2 次 re-arm」+「最近一次广播后 ≥15 s 完全无手机活动」。
+        // 后者就是 controller 侧未真正广播的最直接证据（假在线时 CB 永远不会告诉我们真相）。
+        let sinceLastStart = lastAdvertisingStartedAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        let idleSinceActivity = Date().timeIntervalSince(lastCentralActivity)
+        if consecutiveRearms >= 2, sinceLastStart >= 15, idleSinceActivity >= 15 {
+            consecutiveRearms = 0
+            let backoff = deepRebuildBackoff
+            deepRebuildCooldownUntil = Date().addingTimeInterval(backoff)
+            deepRebuildBackoffIndex = min(deepRebuildBackoffIndex + 1, 2)
+            log("[ADV] 连续 2 次 re-arm 且最近一次广播后 \(Int(sinceLastStart))s 无任何手机活动，"
+                + "判定 controller 侧“假在线”，请求深度重建（下次升级冷却 \(Int(backoff))s）\(advStateDescription())")
+            requestDeepRebuild(reason: "连续 re-arm 无活动")
+            return
+        }
+        if consecutiveRearms >= 2 {
+            log("[ADV] 连续 \(consecutiveRearms) 次 re-arm 仍无订阅，但最近一次广播后仅 "
+                + "\(String(format: "%.1f", sinceLastStart))s / 空闲 \(Int(idleSinceActivity))s，"
+                + "证据不足以判定 controller 卡死，继续轻量 re-arm（不重建 GATT）")
+        }
+
+        manager.stopAdvertising()
+        advertisingOperationUntil = Date().addingTimeInterval(0.4)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self = self else { return }
+            guard self.manager.state == .poweredOn, self.serviceBuilt, self.subscribedCentrals.isEmpty else {
+                // 手机刚好连上/状态变化：这是正常情况，但必须留痕，不能静默消失。
+                log("[ADV] 强制 re-arm 的重新广播被跳过：状态已变化 \(self.advStateDescription())")
+                return
+            }
+            log("[ADV] 强制 re-arm 重新广播（\(reason)）：\(self.advStateDescription())")
+            self.startAdvertising(reason: "强制 re-arm·" + reason, force: true)
+        }
     }
 
     private func buildService() {
@@ -681,19 +1270,69 @@ final class PeripheralServer: NSObject, CBPeripheralManagerDelegate {
 
         let service = CBMutableService(type: kServiceUUID, primary: true)
         service.characteristics = [commandChar, statusChar, infoChar]
+        serviceBuilt = false
+        serviceAddPending = true
+        serviceAddStartedAt = Date()
         manager.add(service)
+        log("[GATT] 已提交 GATT 服务注册（\(kServiceUUID.uuidString)），等待 didAdd 回调")
     }
 
-    private func startAdvertising() {
-        guard manager.state == .poweredOn else { return }
-        guard !manager.isAdvertising else { return }
-        manager.startAdvertising([
-            CBAdvertisementDataServiceUUIDsKey: [kServiceUUID],
-            CBAdvertisementDataLocalNameKey: deviceName,
-        ])
+    // MARK: 服务注册失败的重试与 manager 重建
+
+    /// 服务注册失败后的重试延迟：0.5 → 1 → 2 → 4 s（上限 4 s）。
+    private func serviceAddRetryDelay() -> TimeInterval {
+        min(0.5 * pow(2.0, Double(max(0, serviceAddFailCount - 1))), 4.0)
     }
 
+    /// 安排一次服务重新注册；连续失败达到 3 次时重建 CBPeripheralManager。
+    /// 唤醒后 CoreBluetooth 不再回调 didAdd 时，add/remove 的任何组合都不会恢复，
+    /// 只有换一个新的 manager 才能重新获得广播能力（否则手机永远扫不到）。
+    private func scheduleServiceRebuild(delay: TimeInterval) {
+        guard manager != nil else { return }
+        if serviceAddFailCount >= 3 {
+            rebuildPeripheralManager()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.ensureAdvertising(reason: "服务注册重试")
+        }
+    }
+
+    /// 重建 CBPeripheralManager。旧实例的回调由各 delegate 里的 `peripheral === manager` 守卫忽略。
+    private func rebuildPeripheralManager() {
+        log("[BLE][WARN] 重建 CBPeripheralManager：连续 \(serviceAddFailCount) 次服务注册未成功，"
+            + "按经验这比继续 add/remove 更可靠 \(advStateDescription())")
+        serviceAddFailCount = 0
+        serviceBuilt = false
+        serviceAddPending = false
+        serviceAddStartedAt = nil
+        subscribedCentrals.removeAll()
+        pendingStatus = nil
+        deepRebuildCooldownUntil = nil
+        manager.stopAdvertising()
+        manager.removeAllServices()
+        manager = CBPeripheralManager(delegate: self, queue: nil)
+        // 新 manager 的 poweredOn 回调会重新注册服务；1 s 后仍无进展就主动自检一次。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.ensureAdvertising(reason: "重建 manager 后自检")
+        }
+    }
+
+    /// 更新状态特征。
+    ///
+    /// 线程安全：可能从 CB 回调队列（主队列）调用，也可能从 unlockQueue 的
+    /// 解锁流程里调用；真正的状态改动与 updateValue 一律回到主队列执行
+    /// （CBPeripheralManager 的 delegate 队列即主队列）。
     func setStatus(_ text: String) {
+        if Thread.isMainThread {
+            applyStatus(text)
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.applyStatus(text) }
+        }
+    }
+
+    private func applyStatus(_ text: String) {
+        guard manager != nil else { return }
         statusValue = text
         // 注意：不要给 statusChar.value 赋值。带 .notify 的特征一旦被赋予缓存值，
         // 之后 manager.add(service) 会抛 "Characteristics with cached values must be read-only"。
@@ -705,56 +1344,226 @@ final class PeripheralServer: NSObject, CBPeripheralManagerDelegate {
         }
     }
 
+    // MARK: 周期健康检查（2.5 s）
+
+    private func startAdvertisingHealthTimer() {
+        advertiseTimer?.invalidate()
+        // 20 s 的旧周期意味着广播一旦被系统停掉，手机最长有 20 s 扫不到设备。
+        // 2.5 s 健康检查把这段盲区压到 2.5 s 以内；只有状态发生翻转时才写日志，避免刷屏。
+        let timer = Timer(timeInterval: 2.5, repeats: true) { [weak self] _ in
+            self?.advertisingHealthCheck()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        advertiseTimer = timer
+    }
+
+    private func advertisingHealthCheck() {
+        guard manager != nil, manager.state == .poweredOn else { return }
+        if !serviceBuilt {
+            // didAdd 正常应在毫秒级返回；系统刚唤醒时可能丢回调。
+            // 超过 2 s 没有 didAdd 就视为注册失败，重新提交（2.5 s 检查周期内可自愈）。
+            if serviceAddPending, let started = serviceAddStartedAt,
+               Date().timeIntervalSince(started) > 2.0 {
+                // 先 removeAllServices 再重新 add：如果服务其实已经注册、只是 didAdd 回调丢了，
+                // 直接 add 会得到重复服务（手机侧看到两套特征）；移除一次再注册最稳。
+                serviceAddFailCount += 1
+                log("[GATT] didAdd 超过 2 s 未回调（连续第 \(serviceAddFailCount) 次）："
+                    + "先 removeAllServices 再重新注册服务")
+                manager?.removeAllServices()
+                serviceAddPending = false
+                serviceAddStartedAt = nil
+                serviceBuilt = false
+                if serviceAddFailCount >= 3 {
+                    log("[GATT][ERROR] didAdd 连续 \(serviceAddFailCount) 次丢失：重建 CBPeripheralManager 以恢复广播")
+                    rebuildPeripheralManager()
+                } else {
+                    scheduleServiceRebuild(delay: serviceAddRetryDelay())
+                }
+                return
+            }
+            if !serviceAddPending { buildService() }   // 服务丢失（例如 removeAllServices 后）→ 重新注册
+            return
+        }
+        guard !manager.isAdvertising else {
+            lastHealthAdvertisingOK = true
+            return
+        }
+        if lastHealthAdvertisingOK != false {
+            lastHealthAdvertisingOK = false
+            // 统一走 ensureAdvertising：经过串行闸门 + 服务就绪检查，避免与 watchdog 的
+            // stop→start 窗口重叠。注意这里仍然看不到「假在线」——那种情况由 idle watchdog 兜底。
+            log("[ADV] 周期重播：检测到广播已停止，立即重新开始 \(advStateDescription())")
+        }
+        ensureAdvertising(reason: "周期重播")
+    }
+
+    // MARK: CBPeripheralManagerDelegate
+
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
+        // 重建 manager 后旧实例可能仍回调：只处理当前实例，避免把新状态机打乱。
+        guard peripheral === manager else { return }
         switch peripheral.state {
         case .poweredOn:
-            log("蓝牙已就绪，注册 GATT 服务")
-            buildService()
-            startAdvertising()
-            // 定期重新广播，避免锁屏/系统休眠后广播被停掉
-            advertiseTimer?.invalidate()
-            advertiseTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-                self?.startAdvertising()
-            }
-            RunLoop.main.add(advertiseTimer!, forMode: .common)
-            setStatus("READY")
+            log("[BLE] 蓝牙已就绪（poweredOn）：注册 GATT 服务，注册成功后再广播")
+            serviceBuilt = false
+            serviceAddPending = false
+            serviceAddStartedAt = nil
+            serviceAddFailCount = 0
+            pendingStatus = nil
+            buildService()                 // didAdd 成功后会立即 startAdvertising
+            startAdvertisingHealthTimer()
+            // 「假在线」兜底：isAdvertising 可能是 true 但 controller 没广播，
+            // 所以必须有一个不看 isAdvertising 的 idle watchdog。
+            startIdleRearmTimer()
         case .poweredOff:
-            log("蓝牙已关闭，等待重新开启")
+            log("[BLE] 蓝牙已关闭（poweredOff）：停止广播并移除所有 GATT 服务，等待重新开启")
+            advertiseTimer?.invalidate()
+            advertiseTimer = nil
+            stopIdleRearmTimer()
+            clearPendingAdvertisingWork()
+            manager.stopAdvertising()
+            manager.removeAllServices()
+            serviceBuilt = false
+            serviceAddPending = false
+            serviceAddStartedAt = nil
+            subscribedCentrals.removeAll()
+            pendingStatus = nil
+            statusValue = "READY"
         case .unauthorized:
-            log("蓝牙权限被拒绝，请在「系统设置 → 隐私与安全性 → 蓝牙」中授权")
+            log("[BLE] 蓝牙权限被拒绝（unauthorized）：请在「系统设置 → 隐私与安全性 → 蓝牙」中授权")
+        case .resetting:
+            log("[BLE] 蓝牙状态重置中（resetting）：停止广播并丢弃服务状态，等待下一次 poweredOn 自动恢复")
+            advertiseTimer?.invalidate()
+            advertiseTimer = nil
+            stopIdleRearmTimer()
+            clearPendingAdvertisingWork()
+            serviceBuilt = false
+            serviceAddPending = false
+            serviceAddStartedAt = nil
+            subscribedCentrals.removeAll()
         default:
-            break
+            log("[BLE] 蓝牙状态变化：\(stateName(peripheral.state))，等待就绪")
         }
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
-        if let error = error {
-            log("广播失败: \(error.localizedDescription)")
-        } else {
-            log("正在广播，等待手机连接（设备名 \(deviceName)）")
+        guard peripheral === manager else { return }
+        guard let error = error else {
+            let roundTrip: String
+            if let started = lastAdvertisingStartedAt {
+                roundTrip = String(format: "%.3f s", Date().timeIntervalSince(started))
+            } else {
+                roundTrip = "-"
+            }
+            log("[ADV] 广播已生效 #\(advertisingStartCount)（startAdvertising 往返 \(roundTrip)），等待手机连接")
+            advertisingSuccessStreak += 1
+            // 降级只是临时降风险：连续 2 次启动成功说明广播链路正常，恢复完整载荷（带设备名）。
+            if reducedAdvertising, advertisingSuccessStreak >= 2 {
+                reducedAdvertising = false
+                log("[ADV] 连续 \(advertisingSuccessStreak) 次广播成功：恢复完整广播载荷（重新带上设备名 \(deviceName)）")
+                if subscribedCentrals.isEmpty {
+                    restartAdvertising(reason: "恢复完整广播载荷")
+                }
+            }
+            // 只在空闲态刷新 READY：force 重播/恢复载荷可能发生在刚发完指令时，
+            // 无条件写 READY 会把 UNLOCKING/OK 洗掉，手机端读到的状态就不对了。
+            if subscribedCentrals.isEmpty, statusValue == "CONNECTED" || statusValue == "READY" {
+                setStatus("READY")
+            }
+            return
+        }
+        advertisingFailCount += 1
+        advertisingSuccessStreak = 0
+        lastAdvertisingStartedAt = nil
+        log("[ADV] 广播失败 #\(advertisingFailCount)：\(error.localizedDescription)")
+        if !reducedAdvertising {
+            // 常见原因是广播数据过大/系统繁忙。降级为只带 service UUID：
+            // Android 端按 service UUID 过滤，不影响发现；只是人工用设备名扫描会看不到。
+            reducedAdvertising = true
+            log("[ADV] 降级广播载荷：去掉本地名，只保留 service UUID")
+        }
+        // 300 ms 后重试；仍失败则交给 2.5 s 周期健康检查持续兜底。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.ensureAdvertising(reason: "广播失败重试")
         }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
-        if let error = error {
-            log("添加服务失败: \(error.localizedDescription)")
-        } else {
-            log("GATT 服务已就绪（Service \(kServiceUUID.uuidString)）")
+        guard peripheral === manager else { return }
+        // 没有待处理的 add 时，这个回调只能来自已经被 removeAllServices 移除的旧服务
+        // （唤醒/关闭蓝牙时可能迟到）。直接采纳会让 serviceBuilt 与实际数据库不一致，
+        // 进而「广播了但手机发现不了服务」，所以这里忽略，交给健康检查自愈。
+        guard serviceAddPending else {
+            log("[GATT] 忽略过期的 didAdd 回调（\(service.uuid.uuidString)），由周期检查自愈")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.ensureAdvertising(reason: "过期 didAdd 后自检")
+            }
+            return
         }
+        serviceAddPending = false
+        serviceAddStartedAt = nil
+        if let error = error {
+            serviceBuilt = false
+            serviceAddFailCount += 1
+            let delay = serviceAddRetryDelay()
+            // 重复 add 会持续失败：重试前必须先 removeAllServices，并指数退避，
+            // 否则就是 0.5 s 无限重试（日志/CPU 双爆，且永远等不到 didAdd）。
+            log("[GATT] 添加服务失败（连续第 \(serviceAddFailCount) 次）：\(error.localizedDescription)，"
+                + "\(String(format: "%.2f", delay)) s 后 removeAllServices 再重试")
+            manager.removeAllServices()
+            scheduleServiceRebuild(delay: delay)
+            return
+        }
+        guard service.uuid == kServiceUUID else { return }
+        serviceBuilt = true
+        serviceAddFailCount = 0
+        log("[GATT] 服务已就绪（\(kServiceUUID.uuidString)），立即开始广播")
+        ensureAdvertising(reason: "didAdd 完成")
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
-        log("手机已订阅状态特征: \(central.identifier.uuidString)")
+        guard peripheral === manager else { return }
+        let sinceAdvertising: String
+        if let started = lastAdvertisingStartedAt {
+            sinceAdvertising = String(format: "%.2f s", Date().timeIntervalSince(started))
+        } else {
+            sinceAdvertising = "-"
+        }
+        log("[CONN] 手机已连接并订阅（central=\(central.identifier.uuidString)，距上次开始广播 \(sinceAdvertising)）")
+        subscribedCentrals.insert(central.identifier)
+        noteCentralActivity("订阅")
+        // 只有已连接的 central 才能设置期望连接延迟：.low 表示更频繁的链路事件
+        // （更低延迟、更高功耗）。这是 macOS 的 CBPeripheralManager API，只是「期望」，
+        // 系统不保证一定采用；但对解锁这种秒级交互通常有收益。
+        peripheral.setDesiredConnectionLatency(CBPeripheralManagerConnectionLatency.low, for: central)
+        log("[CONN] 已请求低延迟连接（CBPeripheralManagerConnectionLatency.low）")
         setStatus("CONNECTED")
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
-        log("手机取消订阅状态特征")
+        guard peripheral === manager else { return }
+        log("[DISC] 手机取消订阅（central=\(central.identifier.uuidString)）：立即重建广播")
+        subscribedCentrals.remove(central.identifier)
+        noteCentralActivity("取消订阅")
+        setStatus("READY")
+        restartAdvertising(reason: "取消订阅后重建广播")
     }
 
-    private var pendingStatus: String?
+    /// 记录一次手机侧活动。idle watchdog 只在「长时间没有任何手机活动」时才强制 re-arm，
+    /// 因此真实连接/读写期间不会被误触发。活动本身也证明广播链路是通的：清零连续 re-arm 计数。
+    private func noteCentralActivity(_ what: String) {
+        lastCentralActivity = Date()
+        if consecutiveRearms != 0 {
+            log("[ADV] 检测到手机活动（\(what)）：广播链路正常，清零连续 re-arm 计数（原 \(consecutiveRearms)）")
+            consecutiveRearms = 0
+        }
+        // 有手机活动 = 广播确实在 air：把深度重建的退避档位也复位，
+        // 下次真的再“假在线”时仍然从 60 s 起步。
+        deepRebuildBackoffIndex = 0
+    }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        guard peripheral === manager else { return }
         // 上一次 updateValue 因发送队列满而失败，这里补发
         guard let text = pendingStatus, manager.state == .poweredOn, let characteristic = statusChar else { return }
         pendingStatus = nil
@@ -763,54 +1572,87 @@ final class PeripheralServer: NSObject, CBPeripheralManagerDelegate {
 
     func peripheralManager(_ peripheral: CBPeripheralManager,
                            didReceiveWrite requests: [CBATTRequest]) {
+        guard peripheral === manager else { return }
+        // 「假在线」兜底：收到真实写入就说明广播/连接链路是通的，刷新活动时间。
+        noteCentralActivity("写入指令")
+        // 关键：先把 ATT 应答发回去，再做任何校验/执行。
+        // 校验、fork/exec（读钥匙串）、Thread.sleep、AX 注入都是慢操作；在这条
+        // 委托队列（主队列）上同步执行会堵住后续 CB 回调与状态通知，手机端表现为
+        // 「写成功了却迟迟等不到状态回推」——这是连接/解锁慢的主要放大器之一。
+        var pending: [Data] = []
         for request in requests {
-            guard request.characteristic.uuid == kCharCommandUUID else { continue }
-            let data = request.value ?? Data()
-            log("收到写入 \(data.count) 字节")
-
-            // 无论校验结果如何都要应答；带应答写不回会让手机端卡住
+            guard request.characteristic.uuid == kCharCommandUUID else {
+                peripheral.respond(to: request, withResult: .attributeNotFound)
+                continue
+            }
+            // 必须先取载荷再回应答：respond 之后 request.value 的可用性没有保证，
+            // 取到空包会让校验直接走 ERR_LEN（手机显示已发送，但永远不解锁）。
+            // 带应答写：不回会让手机端卡在 writeValue 的回调上。
+            let payload = request.value ?? Data()
             peripheral.respond(to: request, withResult: .success)
+            pending.append(payload)
+        }
+        guard !pending.isEmpty else { return }
+        // 交给专用串行队列处理：既离开主队列，又保证指令串行、unlockInFlight 语义不变
+        unlockQueue.async { [weak self] in
+            guard let self = self else { return }
+            for data in pending { self.handleCommand(data) }
+        }
+    }
 
-            let result = verifyPacket(data, key: key)
-            switch result {
-            case .failed(let reason):
-                log("校验失败: \(reason)")
-                setStatus(reason)
+    /// 解析并执行一条指令。
+    ///
+    /// 必须运行在 `unlockQueue` 上：里面的 verifyPacket / performUnlock / performLock
+    /// 都可能阻塞，而这正是我们要避开的 CB 委托队列。
+    private func handleCommand(_ data: Data) {
+        log("[CMD] 收到写入 \(data.count) 字节，开始校验")
+        switch verifyPacket(data, key: key) {
+        case .failed(let reason):
+            log("[CMD] 校验失败：\(reason)")
+            setStatus(reason)
 
-            case .ok(let command, let index, let force):
-                switch command {
-                case kCmdUnlockFrom:
-                    // 手机指定了要用第几个密码；force 时跳过锁屏校验
-                    setStatus("UNLOCKING")
-                    performUnlock(preferredIndex: index, force: force) { status in
-                        self.setStatus(status)
-                        log("解锁结果: \(status)")
-                    }
-                case kCmdUnlock:
-                    setStatus("UNLOCKING")
-                    performUnlock { status in
-                        self.setStatus(status)
-                        log("解锁结果: \(status)")
-                    }
-                case kCmdLock:
-                    setStatus("LOCKING")
-                    performLock { status in
-                        self.setStatus(status)
-                        log("锁定结果: \(status)")
-                    }
-                case kCmdPing:
-                    log("收到 PING")
-                    setStatus("PONG")
-                default:
-                    log("未知指令 0x\(String(command, radix: 16))")
-                    setStatus("ERR_CMD")
+        case .ok(let command, let index, let force):
+            switch command {
+            case kCmdUnlockFrom:
+                // 手机指定了要用第几个密码；force 时跳过锁屏校验
+                let which = (index ?? 0) + 1
+                log("[UNLOCK] 开始（指定第 \(which) 个密码，force=\(force)）")
+                setStatus("UNLOCKING")
+                performUnlock(preferredIndex: index, force: force) { [weak self] status in
+                    guard let self = self else { return }
+                    log("[UNLOCK] 结束：\(status)")
+                    self.setStatus(status)
                 }
+            case kCmdUnlock:
+                log("[UNLOCK] 开始（默认顺序）")
+                setStatus("UNLOCKING")
+                performUnlock { [weak self] status in
+                    guard let self = self else { return }
+                    log("[UNLOCK] 结束：\(status)")
+                    self.setStatus(status)
+                }
+            case kCmdLock:
+                log("[LOCK] 开始（收到锁定指令）")
+                setStatus("LOCKING")
+                performLock { [weak self] status in
+                    guard let self = self else { return }
+                    log("[LOCK] 结束：\(status)")
+                    self.setStatus(status)
+                }
+            case kCmdPing:
+                log("[CMD] 收到 PING，回复 PONG")
+                setStatus("PONG")
+            default:
+                log("[CMD] 未知指令 0x\(String(command, radix: 16))")
+                setStatus("ERR_CMD")
             }
         }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager,
                            didReceiveRead request: CBATTRequest) {
+        // 「假在线」兜底：能读到特征说明手机确实连上了，刷新活动时间。
+        noteCentralActivity("读取特征")
         if request.characteristic.uuid == kCharStatusUUID {
             let data = statusValue.data(using: .utf8)!
             if request.offset > data.count {
@@ -854,7 +1696,7 @@ ensureSupportDirectory()
 let args = Array(CommandLine.arguments.dropFirst())
 
 if args.contains("--version") {
-    print("BLEUnlockCmd 1.0.0")
+    print("BLEUnlockCmd 1.4.2")
     exit(0)
 }
 
@@ -1431,6 +2273,27 @@ writeDaemonStatus()
 
 let server = PeripheralServer()
 server.start(key: symmetricKey, deviceName: config.deviceName)
+
+// 系统唤醒后蓝牙子系统会重新初始化，之前的广播/服务注册常常已经失效，
+// 手机端表现为「刚唤醒那几分钟怎么都连不上」。
+// 这里监听唤醒通知，立即深度重建 GATT 服务与广播，把盲区压到一次回调的时间。
+let wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+) { _ in
+    log("[WAKE] 系统唤醒：立即深度重建 BLE 广播")
+    server.restartAdvertising(reason: "系统唤醒", deep: true)
+}
+
+// 显示器唤醒（合盖/息屏后）不一定伴随 didWake，单独补一条，只做轻量确认。
+let screenWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main
+) { _ in
+    log("[WAKE] 显示器唤醒：确认广播在线")
+    server.ensureAdvertising(reason: "显示器唤醒")
+}
+
+// 观察者必须一直存活；显式持有，避免被优化掉
+_ = (wakeObserver, screenWakeObserver)
 
 // 防止系统空闲休眠：休眠会停掉蓝牙广播，手机就再也连不上了
 var sleepAssertion = IOPMAssertionID(0)

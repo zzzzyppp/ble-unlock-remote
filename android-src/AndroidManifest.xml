@@ -19,6 +19,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 开机后恢复「保持连接」（BleService 会立刻 startForeground） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 开机拉起 FGS 被拒时，用精确闹钟补一次（Android 12+ 的 FGS 启动豁免项） -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
@@ -44,6 +48,16 @@
             android:name=".BleService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- 开机自恢复：仅当用户仍希望保持连接时才启动服务 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>
